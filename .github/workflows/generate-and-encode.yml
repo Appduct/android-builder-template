@@ -1,0 +1,45 @@
+name: Generate Keystore and Encode to Base64
+
+on: [workflow_dispatch]
+
+jobs:
+  generate-and-encode:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+      
+      - name: Generate Keystore
+        run: |
+          $JAVA_HOME/bin/keytool -genkey -v -keystore appduct-release.keystore \
+            -alias appduct \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass '3|Ft-c&2Q2Rh' \
+            -keypass '3|Ft-c&2Q2Rh' \
+            -dname "CN=Appduct,OU=Engineering,O=Appduct,L=Port Harcourt,ST=Rivers,C=NG"
+      
+      - name: Encode Keystore to Base64
+        run: |
+          base64 -w 0 appduct-release.keystore > appduct-release.keystore.b64
+          echo "Base64 encoded keystore:"
+          cat appduct-release.keystore.b64
+      
+      - name: Upload Keystore
+        uses: actions/upload-artifact@v4
+        with:
+          name: appduct-release-keystore
+          path: appduct-release.keystore
+      
+      - name: Upload Base64 File
+        uses: actions/upload-artifact@v4
+        with:
+          name: appduct-release-keystore-b64
+          path: appduct-release.keystore.b64
