@@ -1,0 +1,6 @@
+-keepattributes *Annotation*
+-keepattributes SourceFile,LineNumberTable
+-keep public class * extends android.app.Activity
+-keep public class * extends android.app.Application
+-keep class android.webkit.** { *; }
+-dontwarn android.webkit.**
