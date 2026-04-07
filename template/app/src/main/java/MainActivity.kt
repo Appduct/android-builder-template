@@ -90,21 +90,61 @@ class MainActivity : AppCompatActivity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         }
         webView.webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) { progressBar.visibility = View.GONE }
-            override fun onPageFinished(view: WebView?, url: String?) { progressBar.visibility = View.GONE; swipeRefresh.isRefreshing = false; dismissSplash() }
-            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) { if (request?.isForMainFrame == true) { progressBar.visibility = View.GONE; swipeRefresh.isRefreshing = false; dismissSplash(); showError("Failed to load the page.") } }
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean { val url = request?.url?.toString() ?: return false; return if (url.startsWith(websiteUrl) || url.startsWith("http://") && Uri.parse(url).host == Uri.parse(websiteUrl).host) { false } else { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))); true } }
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                progressBar.visibility = View.GONE
+            }
+            override fun onPageFinished(view: WebView?, url: String?) {
+                progressBar.visibility = View.GONE
+                swipeRefresh.isRefreshing = false
+                dismissSplash()
+            }
+            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                if (request?.isForMainFrame == true) {
+                    progressBar.visibility = View.GONE
+                    swipeRefresh.isRefreshing = false
+                    dismissSplash()
+                    showError("Failed to load the page. Please check your connection and try again.")
+                }
+            }
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val url = request?.url?.toString() ?: return false
+                if (url.startsWith("http://") || url.startsWith("https://")) {
+                    return false
+                }
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                } catch (_: Exception) { }
+                return true
+            }
         }
         webView.webChromeClient = object : WebChromeClient() {}
     }
 
     private fun setupSwipeRefresh() {
         swipeRefresh.setColorSchemeColors(resources.getColor(R.color.colorPrimary, theme))
-        swipeRefresh.setOnRefreshListener { if (isNetworkAvailable()) { webView.reload() } else { swipeRefresh.isRefreshing = false; showError("No internet connection.") } }
+        swipeRefresh.setOnRefreshListener {
+            if (isNetworkAvailable()) { webView.reload() }
+            else { swipeRefresh.isRefreshing = false; showError("No internet connection.") }
+        }
     }
 
     private fun loadUrl() { webView.loadUrl(websiteUrl) }
-    private fun showError(message: String) { webView.visibility = View.GONE; splashView.visibility = View.GONE; errorView.visibility = View.VISIBLE; errorText.text = message; progressBar.visibility = View.GONE }
-    private fun isNetworkAvailable(): Boolean { val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager; val network = cm.activeNetwork ?: return false; val caps = cm.getNetworkCapabilities(network) ?: return false; return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) }
-    @Deprecated("Use onBackPressedDispatcher") override fun onBackPressed() { if (webView.canGoBack()) { webView.goBack() } else { @Suppress("DEPRECATION") super.onBackPressed() } }
+    private fun showError(message: String) {
+        webView.visibility = View.GONE
+        splashView.visibility = View.GONE
+        errorView.visibility = View.VISIBLE
+        errorText.text = message
+        progressBar.visibility = View.GONE
+    }
+    private fun isNetworkAvailable(): Boolean {
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+    @Deprecated("Use onBackPressedDispatcher")
+    override fun onBackPressed() {
+        if (webView.canGoBack()) { webView.goBack() }
+        else { @Suppress("DEPRECATION") super.onBackPressed() }
+    }
 }
