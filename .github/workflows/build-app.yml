@@ -126,6 +126,14 @@ jobs:
             cp "build-output/app/src/main/res/mipmap-${dir}/ic_launcher.png" "build-output/app/src/main/res/mipmap-${dir}/ic_launcher_round.png"
           done
 
+      - name: Ensure round icons exist
+        run: |
+          for dir in $(find build-output/app/src/main/res -type d -name "mipmap-*"); do
+            if [ -f "$dir/ic_launcher.png" ] && [ ! -f "$dir/ic_launcher_round.png" ]; then
+              cp "$dir/ic_launcher.png" "$dir/ic_launcher_round.png"
+            fi
+          done
+
       - name: Setup signing
         run: |
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > build-output/release.keystore
