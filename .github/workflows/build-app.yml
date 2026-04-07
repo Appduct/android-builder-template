@@ -49,15 +49,18 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Notify build started
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          BUILD_ID: ${{ inputs.build_id }}
+          BUILD_WEBHOOK_SECRET: ${{ secrets.BUILD_WEBHOOK_SECRET }}
         run: |
-          curl -s -X POST "${{ inputs.callback_url }}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "build_id": "${{ inputs.build_id }}",
-              "status": "processing",
-              "logs": "GitHub Actions build started on runner ${{ runner.os }}",
-              "secret": "${{ secrets.BUILD_WEBHOOK_SECRET }}"
-            }' || true
+          bash scripts/post_callback.sh \
+            "$CALLBACK_URL" \
+            "$BUILD_ID" \
+            "processing" \
+            "" \
+            "GitHub Actions build started on runner ${{ runner.os }}" \
+            "$BUILD_WEBHOOK_SECRET" || true
 
       - name: Generate Android project
         run: |
@@ -133,9 +136,35 @@ jobs:
       - name: Upload artifacts to Supabase Storage
         id: upload
         run: |
+          set -euo pipefail
           BUILD_ID="${{ inputs.build_id }}"
           SUPABASE_URL="${{ secrets.SUPABASE_URL }}"
           SERVICE_KEY="${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}"
+
+          upload_file() {
+            local file_path="$1"
+            local object_path="$2"
+            local content_type="$3"
+            local response_file
+            response_file=$(mktemp)
+
+            local http_status
+            http_status=$(curl -sS -o "$response_file" -w "%{http_code}" -X POST "${SUPABASE_URL}/storage/v1/object/app-assets/${object_path}" \
+              -H "Authorization: Bearer ${SERVICE_KEY}" \
+              -H "x-upsert: true" \
+              -H "Content-Type: ${content_type}" \
+              --data-binary @"$file_path")
+
+            if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
+              echo "Storage upload failed for ${object_path} (HTTP ${http_status})" >&2
+              cat "$response_file" >&2
+              rm -f "$response_file"
+              return 1
+            fi
+
+            rm -f "$response_file"
+            printf "%s" "${SUPABASE_URL}/storage/v1/object/public/app-assets/${object_path}"
+          }
           
           # Find built files
           APK_FILE=$(find build-output/app/build/outputs/apk/release -name "*.apk" | head -1)
@@ -146,55 +175,63 @@ jobs:
           # Upload APK
           if [ -f "$APK_FILE" ]; then
             APK_PATH="builds/${BUILD_ID}/app-release.apk"
-            curl -s -X POST "${SUPABASE_URL}/storage/v1/object/app-assets/${APK_PATH}" \
-              -H "Authorization: Bearer ${SERVICE_KEY}" \
-              -H "Content-Type: application/vnd.android.package-archive" \
-              --data-binary @"$APK_FILE"
-            DOWNLOAD_URLS="${SUPABASE_URL}/storage/v1/object/public/app-assets/${APK_PATH}"
-            echo "apk_url=${DOWNLOAD_URLS}" >> $GITHUB_OUTPUT
+            APK_URL=$(upload_file "$APK_FILE" "$APK_PATH" "application/vnd.android.package-archive")
+            DOWNLOAD_URLS="$APK_URL"
+            echo "apk_url=${APK_URL}" >> $GITHUB_OUTPUT
           fi
           
           # Upload AAB
           if [ -f "$AAB_FILE" ]; then
             AAB_PATH="builds/${BUILD_ID}/app-release.aab"
-            curl -s -X POST "${SUPABASE_URL}/storage/v1/object/app-assets/${AAB_PATH}" \
-              -H "Authorization: Bearer ${SERVICE_KEY}" \
-              -H "Content-Type: application/octet-stream" \
-              --data-binary @"$AAB_FILE"
-            AAB_URL="${SUPABASE_URL}/storage/v1/object/public/app-assets/${AAB_PATH}"
+            AAB_URL=$(upload_file "$AAB_FILE" "$AAB_PATH" "application/octet-stream")
             echo "aab_url=${AAB_URL}" >> $GITHUB_OUTPUT
             
             # Use AAB as primary download
             DOWNLOAD_URLS="${AAB_URL}"
+          fi
+
+          if [ -z "$DOWNLOAD_URLS" ]; then
+            echo "No APK or AAB artifacts were found after the build." >&2
+            exit 1
           fi
           
           echo "download_url=${DOWNLOAD_URLS}" >> $GITHUB_OUTPUT
 
       - name: Notify build completed
         if: success()
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          BUILD_ID: ${{ inputs.build_id }}
+          DOWNLOAD_URL: ${{ steps.upload.outputs.download_url }}
+          APK_URL: ${{ steps.upload.outputs.apk_url }}
+          AAB_URL: ${{ steps.upload.outputs.aab_url }}
+          BUILD_WEBHOOK_SECRET: ${{ secrets.BUILD_WEBHOOK_SECRET }}
         run: |
-          curl -s -X POST "${{ inputs.callback_url }}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "build_id": "${{ inputs.build_id }}",
-              "status": "completed",
-              "download_url": "${{ steps.upload.outputs.download_url }}",
-              "logs": "Build completed successfully. APK: ${{ steps.upload.outputs.apk_url || 'N/A' }}, AAB: ${{ steps.upload.outputs.aab_url || 'N/A' }}",
-              "secret": "${{ secrets.BUILD_WEBHOOK_SECRET }}"
-            }'
+          APK_CALLBACK_URL="${APK_URL:-N/A}"
+          AAB_CALLBACK_URL="${AAB_URL:-N/A}"
+          bash scripts/post_callback.sh \
+            "$CALLBACK_URL" \
+            "$BUILD_ID" \
+            "completed" \
+            "$DOWNLOAD_URL" \
+            "Build completed successfully. APK: ${APK_CALLBACK_URL}, AAB: ${AAB_CALLBACK_URL}" \
+            "$BUILD_WEBHOOK_SECRET"
 
       - name: Notify build failed
         if: failure()
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          BUILD_ID: ${{ inputs.build_id }}
+          BUILD_WEBHOOK_SECRET: ${{ secrets.BUILD_WEBHOOK_SECRET }}
         run: |
-          LOGS=$(tail -50 build-output/build.log 2>/dev/null | tr '\n' '\\n' | sed 's/"/\\"/g' || echo "No logs available")
-          curl -s -X POST "${{ inputs.callback_url }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"build_id\": \"${{ inputs.build_id }}\",
-              \"status\": \"failed\",
-              \"logs\": \"Build failed. Last 50 lines: ${LOGS}\",
-              \"secret\": \"${{ secrets.BUILD_WEBHOOK_SECRET }}\"
-            }" || true
+          LOGS=$(tail -50 build-output/build.log 2>/dev/null || echo "No logs available")
+          bash scripts/post_callback.sh \
+            "$CALLBACK_URL" \
+            "$BUILD_ID" \
+            "failed" \
+            "" \
+            "Build failed. Last 50 lines: ${LOGS}" \
+            "$BUILD_WEBHOOK_SECRET" || true
 
       - name: Upload build artifacts
         if: success()
