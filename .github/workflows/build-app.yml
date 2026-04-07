@@ -45,6 +45,11 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
@@ -86,6 +91,13 @@ jobs:
           # Move source files to correct package directory
           mkdir -p "build-output/app/src/main/java/${PACKAGE_PATH}"
           mv build-output/app/src/main/java/MainActivity.kt "build-output/app/src/main/java/${PACKAGE_PATH}/MainActivity.kt"
+
+      - name: Ensure Gradle wrapper
+        working-directory: build-output
+        run: |
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            gradle wrapper --gradle-version 8.5 --no-daemon
+          fi
 
       - name: Download app icon
         if: inputs.app_icon_url != ''
