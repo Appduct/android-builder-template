@@ -33,6 +33,40 @@ on:
         required: false
         default: '#6366F1'
 
+      allow_screenshot:
+        description: 'Allow screenshots (true/false)'
+        required: false
+        default: 'true'
+      allow_rotation:
+        description: 'Allow screen rotation (true/false)'
+        required: false
+        default: 'false'
+      dark_mode:
+        description: 'Force dark mode (true/false)'
+        required: false
+        default: 'false'
+      header_color:
+        description: 'Status bar / header color hex'
+        required: false
+        default: '#6366F1'
+
+      admob_enabled:
+        description: 'Enable AdMob ads (true/false)'
+        required: false
+        default: 'false'
+      admob_app_id:
+        description: 'AdMob Application ID'
+        required: false
+        default: ''
+      admob_banner_id:
+        description: 'AdMob Banner Ad Unit ID'
+        required: false
+        default: 'none'
+      admob_interstitial_id:
+        description: 'AdMob Interstitial Ad Unit ID'
+        required: false
+        default: 'none'
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -86,6 +120,19 @@ jobs:
             sed -i "s|%%PACKAGE_NAME%%|${PACKAGE_NAME}|g" "$file"
             sed -i "s|%%WEBSITE_URL%%|${WEBSITE_URL}|g" "$file"
             sed -i "s|%%SPLASH_BG_COLOR%%|${{ inputs.splash_bg_color }}|g" "$file"
+            sed -i "s|%%ALLOW_SCREENSHOT%%|${{ inputs.allow_screenshot }}|g" "$file"
+            sed -i "s|%%DARK_MODE%%|${{ inputs.dark_mode }}|g" "$file"
+            sed -i "s|%%HEADER_COLOR%%|${{ inputs.header_color }}|g" "$file"
+            sed -i "s|%%ADMOB_ENABLED%%|${{ inputs.admob_enabled }}|g" "$file"
+            sed -i "s|%%ADMOB_APP_ID%%|${{ inputs.admob_app_id }}|g" "$file"
+            sed -i "s|%%ADMOB_BANNER_ID%%|${{ inputs.admob_banner_id }}|g" "$file"
+            sed -i "s|%%ADMOB_INTERSTITIAL_ID%%|${{ inputs.admob_interstitial_id }}|g" "$file"
+            ORIENTATION="${{ inputs.allow_rotation }}"
+            if [ "$ORIENTATION" = "true" ]; then
+              sed -i "s|%%SCREEN_ORIENTATION%%|fullSensor|g" "$file"
+            else
+              sed -i "s|%%SCREEN_ORIENTATION%%|portrait|g" "$file"
+            fi
           done
           
           mkdir -p "build-output/app/src/main/java/${PACKAGE_PATH}"
