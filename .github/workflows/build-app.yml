@@ -32,32 +32,33 @@ on:
         description: 'Splash screen background color'
         required: false
         default: '#6366F1'
-
       allow_screenshot:
-        description: 'Allow screenshots (true/false)'
+        description: 'Allow screenshots'
         required: false
         default: 'true'
       allow_rotation:
-        description: 'Allow screen rotation (true/false)'
+        description: 'Allow screen rotation'
         required: false
         default: 'false'
       dark_mode:
-        description: 'Force dark mode (true/false)'
+        description: 'Force dark mode'
         required: false
         default: 'false'
       header_color:
-        description: 'Status bar / header color hex'
+        description: 'Status bar header color'
         required: false
         default: '#6366F1'
-
+      screen_orientation:
+        description: 'Screen orientation value'
+        required: false
+        default: 'portrait'
       admob_enabled:
-        description: 'Enable AdMob ads (true/false)'
+        description: 'Enable AdMob'
         required: false
         default: 'false'
       admob_app_id:
         description: 'AdMob Application ID'
         required: false
-        default: ''
       admob_banner_id:
         description: 'AdMob Banner Ad Unit ID'
         required: false
@@ -108,33 +109,41 @@ jobs:
         run: |
           mkdir -p build-output
           
+          # Set variables
           APP_NAME="${{ inputs.project_name }}"
           PACKAGE_NAME="${{ inputs.package_name }}"
           WEBSITE_URL="${{ inputs.website_url }}"
           PACKAGE_PATH=$(echo "$PACKAGE_NAME" | tr '.' '/')
+          ALLOW_SCREENSHOT="${{ inputs.allow_screenshot }}"
+          ALLOW_ROTATION="${{ inputs.allow_rotation }}"
+          DARK_MODE="${{ inputs.dark_mode }}"
+          HEADER_COLOR="${{ inputs.header_color }}"
+          SCREEN_ORIENTATION="${{ inputs.screen_orientation }}"
+          ADMOB_ENABLED="${{ inputs.admob_enabled }}"
+          ADMOB_APP_ID="${{ inputs.admob_app_id }}"
+          ADMOB_BANNER_ID="${{ inputs.admob_banner_id }}"
+          ADMOB_INTERSTITIAL_ID="${{ inputs.admob_interstitial_id }}"
           
+          # Copy template
           cp -r template/* build-output/
           
+          # Replace placeholders in all files
           find build-output -type f \( -name "*.gradle" -o -name "*.xml" -o -name "*.kt" -o -name "*.properties" \) | while read file; do
             sed -i "s|%%APP_NAME%%|${APP_NAME}|g" "$file"
             sed -i "s|%%PACKAGE_NAME%%|${PACKAGE_NAME}|g" "$file"
             sed -i "s|%%WEBSITE_URL%%|${WEBSITE_URL}|g" "$file"
             sed -i "s|%%SPLASH_BG_COLOR%%|${{ inputs.splash_bg_color }}|g" "$file"
-            sed -i "s|%%ALLOW_SCREENSHOT%%|${{ inputs.allow_screenshot }}|g" "$file"
-            sed -i "s|%%DARK_MODE%%|${{ inputs.dark_mode }}|g" "$file"
-            sed -i "s|%%HEADER_COLOR%%|${{ inputs.header_color }}|g" "$file"
-            sed -i "s|%%ADMOB_ENABLED%%|${{ inputs.admob_enabled }}|g" "$file"
-            sed -i "s|%%ADMOB_APP_ID%%|${{ inputs.admob_app_id }}|g" "$file"
-            sed -i "s|%%ADMOB_BANNER_ID%%|${{ inputs.admob_banner_id }}|g" "$file"
-            sed -i "s|%%ADMOB_INTERSTITIAL_ID%%|${{ inputs.admob_interstitial_id }}|g" "$file"
-            ORIENTATION="${{ inputs.allow_rotation }}"
-            if [ "$ORIENTATION" = "true" ]; then
-              sed -i "s|%%SCREEN_ORIENTATION%%|fullSensor|g" "$file"
-            else
-              sed -i "s|%%SCREEN_ORIENTATION%%|portrait|g" "$file"
-            fi
+            sed -i "s|%%ALLOW_SCREENSHOT%%|${ALLOW_SCREENSHOT}|g" "$file"
+            sed -i "s|%%DARK_MODE%%|${DARK_MODE}|g" "$file"
+            sed -i "s|%%HEADER_COLOR%%|${HEADER_COLOR}|g" "$file"
+            sed -i "s|%%SCREEN_ORIENTATION%%|${SCREEN_ORIENTATION}|g" "$file"
+            sed -i "s|%%ADMOB_ENABLED%%|${ADMOB_ENABLED}|g" "$file"
+            sed -i "s|%%ADMOB_APP_ID%%|${ADMOB_APP_ID}|g" "$file"
+            sed -i "s|%%ADMOB_BANNER_ID%%|${ADMOB_BANNER_ID}|g" "$file"
+            sed -i "s|%%ADMOB_INTERSTITIAL_ID%%|${ADMOB_INTERSTITIAL_ID}|g" "$file"
           done
           
+          # Move source files to correct package directory
           mkdir -p "build-output/app/src/main/java/${PACKAGE_PATH}"
           mv build-output/app/src/main/java/MainActivity.kt "build-output/app/src/main/java/${PACKAGE_PATH}/MainActivity.kt"
 
@@ -144,9 +153,6 @@ jobs:
           if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
             gradle wrapper --gradle-version 8.5 --no-daemon
           fi
-
-      - name: Install ImageMagick
-        run: sudo apt-get install -y imagemagick > /dev/null 2>&1
 
       - name: Download app icon
         if: inputs.app_icon_url != ''
@@ -158,7 +164,11 @@ jobs:
           mkdir -p build-output/app/src/main/res/mipmap-hdpi
           mkdir -p build-output/app/src/main/res/mipmap-mdpi
           
+          # Download and resize icon for each density
           curl -sL "$ICON_URL" -o /tmp/icon_original.png
+          
+          # Install imagemagick
+          sudo apt-get install -y imagemagick > /dev/null 2>&1
           
           convert /tmp/icon_original.png -resize 192x192 build-output/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
           convert /tmp/icon_original.png -resize 144x144 build-output/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
@@ -166,6 +176,7 @@ jobs:
           convert /tmp/icon_original.png -resize 72x72 build-output/app/src/main/res/mipmap-hdpi/ic_launcher.png
           convert /tmp/icon_original.png -resize 48x48 build-output/app/src/main/res/mipmap-mdpi/ic_launcher.png
           
+          # Copy as round icons too
           for dir in xxxhdpi xxhdpi xhdpi hdpi mdpi; do
             cp "build-output/app/src/main/res/mipmap-${dir}/ic_launcher.png" "build-output/app/src/main/res/mipmap-${dir}/ic_launcher_round.png"
           done
@@ -173,28 +184,25 @@ jobs:
       - name: Download splash screen image
         run: |
           SPLASH_URL="${{ inputs.splash_screen_url }}"
-          mkdir -p build-output/app/src/main/res/drawable-xxxhdpi
-          mkdir -p build-output/app/src/main/res/drawable-xxhdpi
-          mkdir -p build-output/app/src/main/res/drawable-xhdpi
-          mkdir -p build-output/app/src/main/res/drawable-hdpi
-          mkdir -p build-output/app/src/main/res/drawable-mdpi
+          DRAWABLE_DIR="build-output/app/src/main/res/drawable"
+          mkdir -p "$DRAWABLE_DIR"
           
-          if [ -n "$SPLASH_URL" ]; then
-            echo "Downloading splash screen from $SPLASH_URL"
+          sudo apt-get install -y imagemagick > /dev/null 2>&1 || true
+          
+          if [ -n "$SPLASH_URL" ] && [ "$SPLASH_URL" != "" ]; then
+            echo "Downloading splash image from $SPLASH_URL"
             curl -sL "$SPLASH_URL" -o /tmp/splash_original.png
-          elif [ -f /tmp/icon_original.png ]; then
-            echo "No splash screen URL - using app icon as splash image"
-            cp /tmp/icon_original.png /tmp/splash_original.png
+            if [ -f /tmp/splash_original.png ] && [ -s /tmp/splash_original.png ]; then
+              convert /tmp/splash_original.png -resize 1080x1920 "${DRAWABLE_DIR}/splash_image.png"
+              echo "Splash image downloaded and resized"
+            else
+              echo "Download failed, generating default splash image"
+              convert -size 1080x1920 xc:"${{ inputs.splash_bg_color }}" "${DRAWABLE_DIR}/splash_image.png"
+            fi
           else
-            echo "No splash screen or icon - using default mipmap"
-            cp build-output/app/src/main/res/mipmap-hdpi/ic_launcher.png /tmp/splash_original.png
+            echo "No splash URL provided, generating default splash image"
+            convert -size 1080x1920 xc:"${{ inputs.splash_bg_color }}" "${DRAWABLE_DIR}/splash_image.png"
           fi
-          
-          convert /tmp/splash_original.png -resize 384x384 build-output/app/src/main/res/drawable-xxxhdpi/splash_image.png
-          convert /tmp/splash_original.png -resize 288x288 build-output/app/src/main/res/drawable-xxhdpi/splash_image.png
-          convert /tmp/splash_original.png -resize 192x192 build-output/app/src/main/res/drawable-xhdpi/splash_image.png
-          convert /tmp/splash_original.png -resize 144x144 build-output/app/src/main/res/drawable-hdpi/splash_image.png
-          convert /tmp/splash_original.png -resize 96x96 build-output/app/src/main/res/drawable-mdpi/splash_image.png
 
       - name: Ensure round icons exist
         run: |
@@ -256,11 +264,13 @@ jobs:
             printf "%s" "${SUPABASE_URL}/storage/v1/object/public/app-assets/${object_path}"
           }
           
+          # Find built files
           APK_FILE=$(find build-output/app/build/outputs/apk/release -name "*.apk" | head -1)
           AAB_FILE=$(find build-output/app/build/outputs/bundle/release -name "*.aab" | head -1)
           
           DOWNLOAD_URLS=""
           
+          # Upload APK
           if [ -f "$APK_FILE" ]; then
             APK_PATH="builds/${BUILD_ID}/app-release.apk"
             APK_URL=$(upload_file "$APK_FILE" "$APK_PATH" "application/vnd.android.package-archive")
@@ -268,11 +278,13 @@ jobs:
             echo "apk_url=${APK_URL}" >> $GITHUB_OUTPUT
           fi
           
+          # Upload AAB
           if [ -f "$AAB_FILE" ]; then
             AAB_PATH="builds/${BUILD_ID}/app-release.aab"
             AAB_URL=$(upload_file "$AAB_FILE" "$AAB_PATH" "application/octet-stream")
             echo "aab_url=${AAB_URL}" >> $GITHUB_OUTPUT
             
+            # Use AAB as primary download
             DOWNLOAD_URLS="${AAB_URL}"
           fi
 
