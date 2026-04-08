@@ -3,6 +3,7 @@ package %%PACKAGE_NAME%%
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -10,12 +11,18 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.View
+import android.view.WindowManager
 import android.view.animation.AlphaAnimation
 import android.webkit.*
+import android.widget.FrameLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import com.google.android.gms.ads.*
+import com.google.android.gms.ads.interstitial.InterstitialAd
+import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
 
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
@@ -24,13 +31,42 @@ class MainActivity : AppCompatActivity() {
     private lateinit var errorView: View
     private lateinit var errorText: TextView
     private lateinit var splashView: View
+    private lateinit var fullscreenContainer: FrameLayout
 
     private val websiteUrl = "%%WEBSITE_URL%%"
     private var splashDismissed = false
+    private var fullscreenView: View? = null
+    private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
+
+    private val admobEnabled = %%ADMOB_ENABLED%%
+    private var bannerAdView: AdView? = null
+    private var interstitialAd: InterstitialAd? = null
+    private val admobBannerId = "%%ADMOB_BANNER_ID%%"
+    private val admobInterstitialId = "%%ADMOB_INTERSTITIAL_ID%%"
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        val darkMode = %%DARK_MODE%%
+        if (darkMode) {
+            AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES)
+        } else {
+            AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM)
+        }
+
+        val allowScreenshot = %%ALLOW_SCREENSHOT%%
+        if (!allowScreenshot) {
+            window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        }
+
+        val headerColor = "%%HEADER_COLOR%%"
+        if (headerColor.isNotEmpty() && headerColor != "default") {
+            try {
+                window.statusBarColor = Color.parseColor(headerColor)
+            } catch (_: Exception) {}
+        }
+
         setContentView(R.layout.activity_main)
 
         webView = findViewById(R.id.webView)
@@ -39,6 +75,7 @@ class MainActivity : AppCompatActivity() {
         errorView = findViewById(R.id.errorView)
         errorText = findViewById(R.id.errorText)
         splashView = findViewById(R.id.splashView)
+        fullscreenContainer = findViewById(R.id.fullscreenContainer)
 
         val retryButton = findViewById<View>(R.id.retryButton)
         retryButton.setOnClickListener {
@@ -52,6 +89,10 @@ class MainActivity : AppCompatActivity() {
         setupWebView()
         setupSwipeRefresh()
 
+        if (admobEnabled) {
+            setupAdMob()
+        }
+
         splashView.visibility = View.VISIBLE
         webView.visibility = View.INVISIBLE
 
@@ -61,6 +102,28 @@ class MainActivity : AppCompatActivity() {
             dismissSplash()
             showError("No internet connection. Please check your network and try again.")
         }
+    }
+
+    private fun setupAdMob() {
+        MobileAds.initialize(this)
+        if (admobBannerId.isNotEmpty() && admobBannerId != "none") {
+            bannerAdView = findViewById(R.id.adView)
+            bannerAdView?.let { adView ->
+                adView.visibility = View.VISIBLE
+                adView.loadAd(AdRequest.Builder().build())
+            }
+        }
+        if (admobInterstitialId.isNotEmpty() && admobInterstitialId != "none") {
+            loadInterstitialAd()
+        }
+    }
+
+    private fun loadInterstitialAd() {
+        val adRequest = AdRequest.Builder().build()
+        InterstitialAd.load(this, admobInterstitialId, adRequest, object : InterstitialAdLoadCallback() {
+            override fun onAdLoaded(ad: InterstitialAd) { interstitialAd = ad }
+            override fun onAdFailedToLoad(error: LoadAdError) { interstitialAd = null }
+        })
     }
 
     private fun dismissSplash() {
@@ -117,7 +180,31 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
         }
-        webView.webChromeClient = object : WebChromeClient() {}
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                fullscreenView = view
+                fullscreenCallback = callback
+                fullscreenContainer.addView(view)
+                fullscreenContainer.visibility = View.VISIBLE
+                webView.visibility = View.GONE
+                swipeRefresh.visibility = View.GONE
+                window.decorView.systemUiVisibility = (
+                    View.SYSTEM_UI_FLAG_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                )
+            }
+            override fun onHideCustomView() {
+                fullscreenContainer.removeAllViews()
+                fullscreenContainer.visibility = View.GONE
+                webView.visibility = View.VISIBLE
+                swipeRefresh.visibility = View.VISIBLE
+                fullscreenCallback?.onCustomViewHidden()
+                fullscreenView = null
+                fullscreenCallback = null
+                window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+            }
+        }
     }
 
     private fun setupSwipeRefresh() {
@@ -144,7 +231,31 @@ class MainActivity : AppCompatActivity() {
     }
     @Deprecated("Use onBackPressedDispatcher")
     override fun onBackPressed() {
+        if (fullscreenView != null) {
+            fullscreenCallback?.onCustomViewHidden()
+            fullscreenContainer.removeAllViews()
+            fullscreenContainer.visibility = View.GONE
+            webView.visibility = View.VISIBLE
+            swipeRefresh.visibility = View.VISIBLE
+            fullscreenView = null
+            fullscreenCallback = null
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+            return
+        }
         if (webView.canGoBack()) { webView.goBack() }
         else { @Suppress("DEPRECATION") super.onBackPressed() }
+    }
+
+    override fun onPause() {
+        bannerAdView?.pause()
+        super.onPause()
+    }
+    override fun onResume() {
+        super.onResume()
+        bannerAdView?.resume()
+    }
+    override fun onDestroy() {
+        bannerAdView?.destroy()
+        super.onDestroy()
     }
 }
