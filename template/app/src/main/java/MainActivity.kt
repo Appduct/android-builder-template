@@ -1,6 +1,7 @@
 package %%PACKAGE_NAME%%
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -17,12 +18,11 @@ import android.webkit.*
 import android.widget.FrameLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
-import com.google.android.gms.ads.*
-import com.google.android.gms.ads.interstitial.InterstitialAd
-import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
 
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
@@ -38,16 +38,32 @@ class MainActivity : AppCompatActivity() {
     private var fullscreenView: View? = null
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
 
-    private val admobEnabled = %%ADMOB_ENABLED%%
-    private var bannerAdView: AdView? = null
-    private var interstitialAd: InterstitialAd? = null
-    private val admobBannerId = "%%ADMOB_BANNER_ID%%"
-    private val admobInterstitialId = "%%ADMOB_INTERSTITIAL_ID%%"
+    private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
+    private lateinit var fileChooserLauncher: ActivityResultLauncher<Intent>
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Register file chooser result handler
+        fileChooserLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            if (result.resultCode == Activity.RESULT_OK) {
+                val data = result.data
+                val resultUris: Array<Uri>? = if (data?.clipData != null) {
+                    Array(data.clipData!!.itemCount) { i -> data.clipData!!.getItemAt(i).uri }
+                } else {
+                    data?.data?.let { arrayOf(it) }
+                }
+                fileUploadCallback?.onReceiveValue(resultUris ?: arrayOf())
+            } else {
+                fileUploadCallback?.onReceiveValue(null)
+            }
+            fileUploadCallback = null
+        }
+
+        // Dark mode
         val darkMode = %%DARK_MODE%%
         if (darkMode) {
             AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES)
@@ -55,11 +71,13 @@ class MainActivity : AppCompatActivity() {
             AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM)
         }
 
+        // Screenshot control
         val allowScreenshot = %%ALLOW_SCREENSHOT%%
         if (!allowScreenshot) {
             window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         }
 
+        // Status bar / header color
         val headerColor = "%%HEADER_COLOR%%"
         if (headerColor.isNotEmpty() && headerColor != "default") {
             try {
@@ -89,10 +107,6 @@ class MainActivity : AppCompatActivity() {
         setupWebView()
         setupSwipeRefresh()
 
-        if (admobEnabled) {
-            setupAdMob()
-        }
-
         splashView.visibility = View.VISIBLE
         webView.visibility = View.INVISIBLE
 
@@ -102,28 +116,6 @@ class MainActivity : AppCompatActivity() {
             dismissSplash()
             showError("No internet connection. Please check your network and try again.")
         }
-    }
-
-    private fun setupAdMob() {
-        MobileAds.initialize(this)
-        if (admobBannerId.isNotEmpty() && admobBannerId != "none") {
-            bannerAdView = findViewById(R.id.adView)
-            bannerAdView?.let { adView ->
-                adView.visibility = View.VISIBLE
-                adView.loadAd(AdRequest.Builder().build())
-            }
-        }
-        if (admobInterstitialId.isNotEmpty() && admobInterstitialId != "none") {
-            loadInterstitialAd()
-        }
-    }
-
-    private fun loadInterstitialAd() {
-        val adRequest = AdRequest.Builder().build()
-        InterstitialAd.load(this, admobInterstitialId, adRequest, object : InterstitialAdLoadCallback() {
-            override fun onAdLoaded(ad: InterstitialAd) { interstitialAd = ad }
-            override fun onAdFailedToLoad(error: LoadAdError) { interstitialAd = null }
-        })
     }
 
     private fun dismissSplash() {
@@ -181,12 +173,35 @@ class MainActivity : AppCompatActivity() {
             }
         }
         webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                // Cancel any existing callback
+                fileUploadCallback?.onReceiveValue(null)
+                fileUploadCallback = filePathCallback
+
+                val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "*/*"
+                }
+                try {
+                    fileChooserLauncher.launch(intent)
+                } catch (_: Exception) {
+                    fileUploadCallback?.onReceiveValue(null)
+                    fileUploadCallback = null
+                    return false
+                }
+                return true
+            }
+
             override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
                 fullscreenView = view
                 fullscreenCallback = callback
                 fullscreenContainer.addView(view)
                 fullscreenContainer.visibility = View.VISIBLE
-                webView.visibility = View.GONE
+                webView?.visibility = View.GONE
                 swipeRefresh.visibility = View.GONE
                 window.decorView.systemUiVisibility = (
                     View.SYSTEM_UI_FLAG_FULLSCREEN
@@ -244,18 +259,5 @@ class MainActivity : AppCompatActivity() {
         }
         if (webView.canGoBack()) { webView.goBack() }
         else { @Suppress("DEPRECATION") super.onBackPressed() }
-    }
-
-    override fun onPause() {
-        bannerAdView?.pause()
-        super.onPause()
-    }
-    override fun onResume() {
-        super.onResume()
-        bannerAdView?.resume()
-    }
-    override fun onDestroy() {
-        bannerAdView?.destroy()
-        super.onDestroy()
     }
 }
