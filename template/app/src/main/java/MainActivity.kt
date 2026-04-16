@@ -16,6 +16,8 @@ import android.view.WindowManager
 import android.view.animation.AlphaAnimation
 import android.webkit.*
 import android.widget.FrameLayout
+import android.widget.ImageButton
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.result.ActivityResultLauncher
@@ -32,8 +34,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var errorText: TextView
     private lateinit var splashView: View
     private lateinit var fullscreenContainer: FrameLayout
+    private lateinit var bottomNav: LinearLayout
 
     private val websiteUrl = "%%WEBSITE_URL%%"
+    private val expiryTimestamp: Long = %%EXPIRY_TIMESTAMP%%L
     private var splashDismissed = false
     private var fullscreenView: View? = null
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
@@ -87,6 +91,12 @@ class MainActivity : AppCompatActivity() {
 
         setContentView(R.layout.activity_main)
 
+        // Trial expiry check (0 = no expiry)
+        if (expiryTimestamp > 0L && System.currentTimeMillis() > expiryTimestamp) {
+            showExpiredScreen()
+            return
+        }
+
         webView = findViewById(R.id.webView)
         swipeRefresh = findViewById(R.id.swipeRefresh)
         progressBar = findViewById(R.id.progressBar)
@@ -94,6 +104,7 @@ class MainActivity : AppCompatActivity() {
         errorText = findViewById(R.id.errorText)
         splashView = findViewById(R.id.splashView)
         fullscreenContainer = findViewById(R.id.fullscreenContainer)
+        bottomNav = findViewById(R.id.bottomNav)
 
         val retryButton = findViewById<View>(R.id.retryButton)
         retryButton.setOnClickListener {
@@ -104,13 +115,23 @@ class MainActivity : AppCompatActivity() {
             loadUrl()
         }
 
-        setupWebView()
-        setupSwipeRefresh()
+        // Feature flags
+        val pullToRefreshEnabled = %%PULL_TO_REFRESH%%
+        val bottomNavEnabled = %%BOTTOM_NAV%%
+        val offlineModeEnabled = %%OFFLINE_MODE%%
+
+        setupWebView(offlineModeEnabled)
+        setupSwipeRefresh(pullToRefreshEnabled)
+        setupBottomNav(bottomNavEnabled)
 
         splashView.visibility = View.VISIBLE
         webView.visibility = View.INVISIBLE
 
         if (isNetworkAvailable()) {
+            loadUrl()
+        } else if (offlineModeEnabled) {
+            // Try cached version
+            webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
             loadUrl()
         } else {
             dismissSplash()
@@ -130,12 +151,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun setupWebView() {
+    private fun setupWebView(offlineMode: Boolean) {
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
+            databaseEnabled = true
             allowFileAccess = true
-            cacheMode = WebSettings.LOAD_DEFAULT
+            // Offline mode: aggressive caching with fallback to cache when offline
+            cacheMode = if (offlineMode) WebSettings.LOAD_CACHE_ELSE_NETWORK else WebSettings.LOAD_DEFAULT
             setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
@@ -157,8 +180,14 @@ class MainActivity : AppCompatActivity() {
                 if (request?.isForMainFrame == true) {
                     progressBar.visibility = View.GONE
                     swipeRefresh.isRefreshing = false
-                    dismissSplash()
-                    showError("Failed to load the page. Please check your connection and try again.")
+                    if (offlineMode) {
+                        // Try loading from cache as fallback
+                        webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                        webView.reload()
+                    } else {
+                        dismissSplash()
+                        showError("Failed to load the page. Please check your connection and try again.")
+                    }
                 }
             }
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -178,7 +207,6 @@ class MainActivity : AppCompatActivity() {
                 filePathCallback: ValueCallback<Array<Uri>>?,
                 fileChooserParams: FileChooserParams?
             ): Boolean {
-                // Cancel any existing callback
                 fileUploadCallback?.onReceiveValue(null)
                 fileUploadCallback = filePathCallback
 
@@ -203,6 +231,7 @@ class MainActivity : AppCompatActivity() {
                 fullscreenContainer.visibility = View.VISIBLE
                 webView?.visibility = View.GONE
                 swipeRefresh.visibility = View.GONE
+                bottomNav.visibility = View.GONE
                 window.decorView.systemUiVisibility = (
                     View.SYSTEM_UI_FLAG_FULLSCREEN
                     or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
@@ -214,6 +243,7 @@ class MainActivity : AppCompatActivity() {
                 fullscreenContainer.visibility = View.GONE
                 webView.visibility = View.VISIBLE
                 swipeRefresh.visibility = View.VISIBLE
+                if (%%BOTTOM_NAV%%) bottomNav.visibility = View.VISIBLE
                 fullscreenCallback?.onCustomViewHidden()
                 fullscreenView = null
                 fullscreenCallback = null
@@ -222,12 +252,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun setupSwipeRefresh() {
+    private fun setupSwipeRefresh(enabled: Boolean) {
+        swipeRefresh.isEnabled = enabled
+        if (!enabled) return
         swipeRefresh.setColorSchemeColors(resources.getColor(R.color.colorPrimary, theme))
         swipeRefresh.setOnRefreshListener {
             if (isNetworkAvailable()) { webView.reload() }
             else { swipeRefresh.isRefreshing = false; showError("No internet connection.") }
         }
+    }
+
+    private fun setupBottomNav(enabled: Boolean) {
+        bottomNav.visibility = if (enabled) View.VISIBLE else View.GONE
+        if (!enabled) return
+        findViewById<ImageButton>(R.id.navBack).setOnClickListener {
+            if (webView.canGoBack()) webView.goBack()
+        }
+        findViewById<ImageButton>(R.id.navForward).setOnClickListener {
+            if (webView.canGoForward()) webView.goForward()
+        }
+        findViewById<ImageButton>(R.id.navRefresh).setOnClickListener { webView.reload() }
+        findViewById<ImageButton>(R.id.navHome).setOnClickListener { loadUrl() }
     }
 
     private fun loadUrl() { webView.loadUrl(websiteUrl) }
@@ -238,6 +283,32 @@ class MainActivity : AppCompatActivity() {
         errorText.text = message
         progressBar.visibility = View.GONE
     }
+    private fun showExpiredScreen() {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#0F172A"))
+            gravity = android.view.Gravity.CENTER
+            setPadding(64, 64, 64, 64)
+        }
+        val title = TextView(this).apply {
+            text = "Trial Expired"
+            setTextColor(Color.WHITE)
+            textSize = 26f
+            gravity = android.view.Gravity.CENTER
+            setPadding(0, 0, 0, 24)
+        }
+        val msg = TextView(this).apply {
+            text = "Your 7-day free trial of this app has ended.\n\nPlease contact the app owner to upgrade and continue using this app."
+            setTextColor(Color.parseColor("#CBD5E1"))
+            textSize = 15f
+            gravity = android.view.Gravity.CENTER
+        }
+        container.addView(title)
+        container.addView(msg)
+        setContentView(container)
+        window.statusBarColor = Color.parseColor("#0F172A")
+    }
+
     private fun isNetworkAvailable(): Boolean {
         val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
         val network = cm.activeNetwork ?: return false
@@ -252,6 +323,7 @@ class MainActivity : AppCompatActivity() {
             fullscreenContainer.visibility = View.GONE
             webView.visibility = View.VISIBLE
             swipeRefresh.visibility = View.VISIBLE
+            if (%%BOTTOM_NAV%%) bottomNav.visibility = View.VISIBLE
             fullscreenView = null
             fullscreenCallback = null
             window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
