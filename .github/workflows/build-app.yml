@@ -67,6 +67,22 @@ on:
         description: 'AdMob Interstitial Ad Unit ID'
         required: false
         default: 'none'
+      pull_to_refresh:
+        description: 'Enable pull-to-refresh'
+        required: false
+        default: 'true'
+      bottom_navigation:
+        description: 'Show bottom navigation bar'
+        required: false
+        default: 'false'
+      offline_mode:
+        description: 'Enable offline cache mode'
+        required: false
+        default: 'false'
+      expiry_timestamp:
+        description: 'Unix ms timestamp when app expires (0 = never)'
+        required: false
+        default: '0'
 
 jobs:
   build:
@@ -123,6 +139,10 @@ jobs:
           ADMOB_APP_ID="${{ inputs.admob_app_id }}"
           ADMOB_BANNER_ID="${{ inputs.admob_banner_id }}"
           ADMOB_INTERSTITIAL_ID="${{ inputs.admob_interstitial_id }}"
+          PULL_TO_REFRESH="${{ inputs.pull_to_refresh }}"
+          BOTTOM_NAV="${{ inputs.bottom_navigation }}"
+          OFFLINE_MODE="${{ inputs.offline_mode }}"
+          EXPIRY_TIMESTAMP="${{ inputs.expiry_timestamp }}"
           
           # Copy template
           cp -r template/* build-output/
@@ -141,6 +161,10 @@ jobs:
             sed -i "s|%%ADMOB_APP_ID%%|${ADMOB_APP_ID}|g" "$file"
             sed -i "s|%%ADMOB_BANNER_ID%%|${ADMOB_BANNER_ID}|g" "$file"
             sed -i "s|%%ADMOB_INTERSTITIAL_ID%%|${ADMOB_INTERSTITIAL_ID}|g" "$file"
+            sed -i "s|%%PULL_TO_REFRESH%%|${PULL_TO_REFRESH}|g" "$file"
+            sed -i "s|%%BOTTOM_NAV%%|${BOTTOM_NAV}|g" "$file"
+            sed -i "s|%%OFFLINE_MODE%%|${OFFLINE_MODE}|g" "$file"
+            sed -i "s|%%EXPIRY_TIMESTAMP%%|${EXPIRY_TIMESTAMP}|g" "$file"
           done
           
           # Move source files to correct package directory
