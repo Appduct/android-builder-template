@@ -1,0 +1,259 @@
+name: Build iOS App
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Build ID from Appduct'
+        required: true
+      project_name:
+        description: 'App display name'
+        required: true
+      website_url:
+        description: 'Website URL to wrap'
+        required: true
+      bundle_id:
+        description: 'iOS bundle identifier (e.g. com.appduct.myapp)'
+        required: true
+      callback_url:
+        description: 'Webhook callback URL'
+        required: true
+      app_icon_url:
+        description: 'URL to app icon (1024x1024 PNG)'
+        required: false
+      header_color:
+        description: 'Status bar / accent color'
+        required: false
+        default: '#6366F1'
+      dark_mode:
+        description: 'Force dark mode (true/false)'
+        required: false
+        default: 'false'
+      pull_to_refresh:
+        description: 'Enable pull-to-refresh (true/false)'
+        required: false
+        default: 'true'
+      app_version:
+        description: 'Marketing version'
+        required: false
+        default: '1.0.0'
+      export_method:
+        description: 'app-store | ad-hoc | enterprise | development'
+        required: false
+        default: 'ad-hoc'
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout template
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app || sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Notify build started
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          BUILD_ID: ${{ inputs.build_id }}
+          BUILD_WEBHOOK_SECRET: ${{ secrets.BUILD_WEBHOOK_SECRET }}
+        run: |
+          bash scripts/post_callback.sh \
+            "$CALLBACK_URL" \
+            "$BUILD_ID" \
+            "processing" \
+            "" \
+            "iOS build started on macOS runner" \
+            "$BUILD_WEBHOOK_SECRET" || true
+
+      - name: Prepare iOS project
+        run: |
+          set -e
+          mkdir -p build-ios
+          cp -R ios-template/* build-ios/
+
+          APP_NAME="${{ inputs.project_name }}"
+          BUNDLE_ID="${{ inputs.bundle_id }}"
+          WEBSITE_URL="${{ inputs.website_url }}"
+          APP_VERSION="${{ inputs.app_version }}"
+          DARK_MODE="${{ inputs.dark_mode }}"
+          PULL_TO_REFRESH="${{ inputs.pull_to_refresh }}"
+          HEADER_COLOR="${{ inputs.header_color }}"
+          TEAM_ID="${{ secrets.IOS_TEAM_ID }}"
+          PP_NAME="${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}"
+          EXPORT_METHOD="${{ inputs.export_method }}"
+
+          find build-ios -type f \( -name "*.swift" -o -name "*.plist" -o -name "*.pbxproj" -o -name "*.storyboard" \) | while read f; do
+            sed -i '' "s|%%APP_NAME%%|${APP_NAME}|g" "$f" || true
+            sed -i '' "s|%%BUNDLE_ID%%|${BUNDLE_ID}|g" "$f" || true
+            sed -i '' "s|%%WEBSITE_URL%%|${WEBSITE_URL}|g" "$f" || true
+            sed -i '' "s|%%APP_VERSION%%|${APP_VERSION}|g" "$f" || true
+            sed -i '' "s|%%DARK_MODE%%|${DARK_MODE}|g" "$f" || true
+            sed -i '' "s|%%PULL_TO_REFRESH%%|${PULL_TO_REFRESH}|g" "$f" || true
+            sed -i '' "s|%%HEADER_COLOR%%|${HEADER_COLOR}|g" "$f" || true
+            sed -i '' "s|%%TEAM_ID%%|${TEAM_ID}|g" "$f" || true
+            sed -i '' "s|%%PROVISIONING_PROFILE_NAME%%|${PP_NAME}|g" "$f" || true
+            sed -i '' "s|%%EXPORT_METHOD%%|${EXPORT_METHOD}|g" "$f" || true
+          done
+
+      - name: Download app icon
+        if: inputs.app_icon_url != ''
+        run: |
+          ICON_URL="${{ inputs.app_icon_url }}"
+          ICON_DIR="build-ios/AppductWebApp/Assets.xcassets/AppIcon.appiconset"
+          curl -sL "$ICON_URL" -o /tmp/icon_orig.png
+          # Use sips (built into macOS) to resize to 1024x1024
+          sips -z 1024 1024 /tmp/icon_orig.png --out "${ICON_DIR}/icon-1024.png" || cp /tmp/icon_orig.png "${ICON_DIR}/icon-1024.png"
+
+      - name: Generate placeholder icon if missing
+        run: |
+          ICON_DIR="build-ios/AppductWebApp/Assets.xcassets/AppIcon.appiconset"
+          if [ ! -f "${ICON_DIR}/icon-1024.png" ]; then
+            HEADER="${{ inputs.header_color }}"
+            # Generate solid color PNG via Python (preinstalled on macos-14)
+            python3 -c "
+import struct, zlib
+w=h=1024
+hex_c='${HEADER}'.lstrip('#') or '6366F1'
+r,g,b=int(hex_c[0:2],16),int(hex_c[2:4],16),int(hex_c[4:6],16)
+raw=b''.join(b'\x00'+(bytes([r,g,b])*w) for _ in range(h))
+def chunk(t,d):
+    return struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)
+sig=b'\x89PNG\r\n\x1a\n'
+ihdr=struct.pack('>IIBBBBB',w,h,8,2,0,0,0)
+idat=zlib.compress(raw)
+with open('${ICON_DIR}/icon-1024.png','wb') as f:
+    f.write(sig+chunk(b'IHDR',ihdr)+chunk(b'IDAT',idat)+chunk(b'IEND',b''))
+"
+          fi
+
+      - name: Import signing certificate
+        env:
+          CERT_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: appduct-keychain-pwd
+        run: |
+          echo "$CERT_BASE64" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import /tmp/cert.p12 -k build.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm -f /tmp/cert.p12
+
+      - name: Install provisioning profile
+        env:
+          PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$PROFILE_BASE64" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/appduct.mobileprovision
+
+      - name: Build & Archive
+        working-directory: build-ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project AppductWebApp.xcodeproj \
+            -scheme AppductWebApp \
+            -configuration Release \
+            -archivePath $PWD/build/AppductWebApp.xcarchive \
+            -destination "generic/platform=iOS" \
+            -allowProvisioningUpdates=NO \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="${{ secrets.IOS_TEAM_ID }}" \
+            PROVISIONING_PROFILE_SPECIFIER="${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}" \
+            archive 2>&1 | tee build.log
+
+      - name: Export IPA
+        working-directory: build-ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -exportArchive \
+            -archivePath $PWD/build/AppductWebApp.xcarchive \
+            -exportPath $PWD/build/ipa \
+            -exportOptionsPlist ExportOptions.plist 2>&1 | tee -a build.log
+
+      - name: Upload IPA to Supabase Storage
+        id: upload
+        run: |
+          set -euo pipefail
+          BUILD_ID="${{ inputs.build_id }}"
+          SUPABASE_URL="${{ secrets.SUPABASE_URL }}"
+          SERVICE_KEY="${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}"
+
+          IPA_FILE=$(find build-ios/build/ipa -name "*.ipa" | head -1)
+          if [ -z "$IPA_FILE" ]; then
+            echo "No IPA produced." >&2
+            exit 1
+          fi
+
+          RAW_NAME="${{ inputs.project_name }}"
+          SAFE_NAME=$(echo "$RAW_NAME" | tr ' ' '-' | tr -cd '[:alnum:]_-' | cut -c1-60)
+          [ -z "$SAFE_NAME" ] && SAFE_NAME="app"
+
+          IPA_PATH="builds/${BUILD_ID}/${SAFE_NAME}.ipa"
+          HTTP_STATUS=$(curl -sS -o /tmp/upload_resp -w "%{http_code}" \
+            -X POST "${SUPABASE_URL}/storage/v1/object/app-assets/${IPA_PATH}" \
+            -H "Authorization: Bearer ${SERVICE_KEY}" \
+            -H "x-upsert: true" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$IPA_FILE")
+
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "Upload failed (HTTP $HTTP_STATUS):" >&2
+            cat /tmp/upload_resp >&2
+            exit 1
+          fi
+
+          IPA_URL="${SUPABASE_URL}/storage/v1/object/public/app-assets/${IPA_PATH}"
+          echo "ipa_url=${IPA_URL}" >> $GITHUB_OUTPUT
+          echo "download_url=${IPA_URL}" >> $GITHUB_OUTPUT
+
+      - name: Notify build completed
+        if: success()
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          BUILD_ID: ${{ inputs.build_id }}
+          DOWNLOAD_URL: ${{ steps.upload.outputs.download_url }}
+          IPA_URL: ${{ steps.upload.outputs.ipa_url }}
+          BUILD_WEBHOOK_SECRET: ${{ secrets.BUILD_WEBHOOK_SECRET }}
+        run: |
+          bash scripts/post_callback.sh \
+            "$CALLBACK_URL" \
+            "$BUILD_ID" \
+            "completed" \
+            "$DOWNLOAD_URL" \
+            "iOS build completed. IPA: ${IPA_URL}" \
+            "$BUILD_WEBHOOK_SECRET"
+
+      - name: Notify build failed
+        if: failure()
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          BUILD_ID: ${{ inputs.build_id }}
+          BUILD_WEBHOOK_SECRET: ${{ secrets.BUILD_WEBHOOK_SECRET }}
+        run: |
+          LOGS=$(tail -80 build-ios/build.log 2>/dev/null || echo "No logs available")
+          bash scripts/post_callback.sh \
+            "$CALLBACK_URL" \
+            "$BUILD_ID" \
+            "failed" \
+            "" \
+            "iOS build failed. Last 80 lines: ${LOGS}" \
+            "$BUILD_WEBHOOK_SECRET" || true
+
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain build.keychain || true
+
+      - name: Upload IPA artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-${{ inputs.build_id }}
+          path: build-ios/build/ipa/*.ipa
+          retention-days: 30
