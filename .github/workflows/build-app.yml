@@ -291,12 +291,20 @@ jobs:
           # Find built files
           APK_FILE=$(find build-output/app/build/outputs/apk/release -name "*.apk" | head -1)
           AAB_FILE=$(find build-output/app/build/outputs/bundle/release -name "*.aab" | head -1)
-          
+
+          # Sanitize app name for use as filename (alphanumeric, dash, underscore only)
+          RAW_APP_NAME="${{ inputs.project_name }}"
+          SAFE_APP_NAME=$(echo "$RAW_APP_NAME" | tr ' ' '-' | tr -cd '[:alnum:]_-' | cut -c1-60)
+          if [ -z "$SAFE_APP_NAME" ]; then
+            SAFE_APP_NAME="app"
+          fi
+          echo "Using filename base: $SAFE_APP_NAME"
+
           DOWNLOAD_URLS=""
           
           # Upload APK
           if [ -f "$APK_FILE" ]; then
-            APK_PATH="builds/${BUILD_ID}/app-release.apk"
+            APK_PATH="builds/${BUILD_ID}/${SAFE_APP_NAME}.apk"
             APK_URL=$(upload_file "$APK_FILE" "$APK_PATH" "application/vnd.android.package-archive")
             DOWNLOAD_URLS="$APK_URL"
             echo "apk_url=${APK_URL}" >> $GITHUB_OUTPUT
@@ -304,7 +312,7 @@ jobs:
           
           # Upload AAB
           if [ -f "$AAB_FILE" ]; then
-            AAB_PATH="builds/${BUILD_ID}/app-release.aab"
+            AAB_PATH="builds/${BUILD_ID}/${SAFE_APP_NAME}.aab"
             AAB_URL=$(upload_file "$AAB_FILE" "$AAB_PATH" "application/octet-stream")
             echo "aab_url=${AAB_URL}" >> $GITHUB_OUTPUT
             
