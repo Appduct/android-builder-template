@@ -45,6 +45,10 @@ class MainActivity : AppCompatActivity() {
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
     private lateinit var fileChooserLauncher: ActivityResultLauncher<Intent>
 
+    // Offline pre-warm cache state
+    private var prewarmDone = false
+    private var prewarmWebView: WebView? = null
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -152,13 +156,28 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView(offlineMode: Boolean) {
+        // Real-time compliance: clear stale caches, cookies, and service-worker storage on launch
+        try {
+            WebStorage.getInstance().deleteAllData()
+            CookieManager.getInstance().flush()
+            webView.clearCache(true)
+            webView.clearHistory()
+            webView.clearFormData()
+            // Disable any service worker caching from the wrapped website
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                ServiceWorkerController.getInstance().setServiceWorkerClient(object : ServiceWorkerClient() {
+                    override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? = null
+                })
+            }
+        } catch (_: Exception) {}
+
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
             allowFileAccess = true
-            // Offline mode: aggressive caching with fallback to cache when offline
-            cacheMode = if (offlineMode) WebSettings.LOAD_CACHE_ELSE_NETWORK else WebSettings.LOAD_DEFAULT
+            // Real-time mode: never serve from cache when online; offline mode falls back to cache
+            cacheMode = if (offlineMode) WebSettings.LOAD_CACHE_ELSE_NETWORK else WebSettings.LOAD_NO_CACHE
             setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
@@ -175,6 +194,11 @@ class MainActivity : AppCompatActivity() {
                 progressBar.visibility = View.GONE
                 swipeRefresh.isRefreshing = false
                 dismissSplash()
+                // Pre-warm offline cache once per launch when Offline Mode is on and we're online
+                if (offlineMode && !prewarmDone && isNetworkAvailable()) {
+                    prewarmDone = true
+                    Handler(Looper.getMainLooper()).postDelayed({ prewarmOfflineCache() }, 1500)
+                }
             }
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 if (request?.isForMainFrame == true) {
@@ -275,7 +299,116 @@ class MainActivity : AppCompatActivity() {
         findViewById<ImageButton>(R.id.navHome).setOnClickListener { loadUrl() }
     }
 
-    private fun loadUrl() { webView.loadUrl(websiteUrl) }
+    private fun loadUrl() {
+        val headers = hashMapOf(
+            "Cache-Control" to "no-cache, no-store, must-revalidate",
+            "Pragma" to "no-cache",
+            "Expires" to "0"
+        )
+        webView.loadUrl(websiteUrl, headers)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Real-time: when user returns to the app, refresh to pick up latest website changes
+        if (::webView.isInitialized && splashDismissed && isNetworkAvailable()) {
+            try { webView.reload() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Offline pre-warm: harvest same-origin links from the current page, then silently
+     * load the top N in a hidden WebView with default cache mode so the HTTP cache is
+     * populated. Result: when the user goes offline later, those pages load from cache.
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun prewarmOfflineCache() {
+        try {
+            val origin = Uri.parse(websiteUrl).let { "${it.scheme}://${it.host}" }
+            val js = """
+                (function() {
+                  try {
+                    var origin = location.origin;
+                    var seen = {};
+                    var out = [];
+                    var anchors = document.querySelectorAll('a[href]');
+                    for (var i = 0; i < anchors.length && out.length < 8; i++) {
+                      var href = anchors[i].href;
+                      if (!href) continue;
+                      if (href.indexOf(origin) !== 0) continue;
+                      if (href.indexOf('#') !== -1) href = href.split('#')[0];
+                      if (href === location.href) continue;
+                      if (seen[href]) continue;
+                      seen[href] = 1;
+                      out.push(href);
+                    }
+                    return JSON.stringify(out);
+                  } catch (e) { return '[]'; }
+                })();
+            """.trimIndent()
+            webView.evaluateJavascript(js) { value ->
+                val urls = mutableListOf<String>()
+                try {
+                    var raw = value ?: "[]"
+                    // evaluateJavascript returns a JSON-encoded string; strip outer quotes & unescape
+                    if (raw.startsWith("\"") && raw.endsWith("\"")) {
+                        raw = raw.substring(1, raw.length - 1).replace("\\\"", "\"").replace("\\\\", "\\")
+                    }
+                    // Naive parse: split on quoted entries
+                    val regex = Regex("\"(https?://[^\"]+)\"")
+                    regex.findAll(raw).forEach { urls.add(it.groupValues[1]) }
+                } catch (_: Exception) {}
+                if (urls.isEmpty()) return@evaluateJavascript
+                runPrewarmQueue(urls.take(5))
+            }
+        } catch (_: Exception) {}
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun runPrewarmQueue(urls: List<String>) {
+        if (urls.isEmpty()) return
+        if (prewarmWebView == null) {
+            prewarmWebView = WebView(this).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.cacheMode = WebSettings.LOAD_DEFAULT
+                settings.userAgentString = webView.settings.userAgentString
+                visibility = View.GONE
+            }
+        }
+        val pw = prewarmWebView ?: return
+        val queue = urls.toMutableList()
+        pw.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                if (queue.isNotEmpty()) {
+                    val next = queue.removeAt(0)
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        try { pw.loadUrl(next) } catch (_: Exception) {}
+                    }, 800)
+                } else {
+                    try { pw.destroy() } catch (_: Exception) {}
+                    prewarmWebView = null
+                }
+            }
+            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                // Skip failed url, continue queue
+                if (request?.isForMainFrame == true && queue.isNotEmpty()) {
+                    val next = queue.removeAt(0)
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        try { pw.loadUrl(next) } catch (_: Exception) {}
+                    }, 500)
+                }
+            }
+        }
+        try { pw.loadUrl(queue.removeAt(0)) } catch (_: Exception) {}
+    }
+
+    override fun onDestroy() {
+        try { prewarmWebView?.destroy() } catch (_: Exception) {}
+        prewarmWebView = null
+        super.onDestroy()
+    }
+
     private fun showError(message: String) {
         webView.visibility = View.GONE
         splashView.visibility = View.GONE
