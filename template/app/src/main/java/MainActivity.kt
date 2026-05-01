@@ -63,8 +63,9 @@ class MainActivity : AppCompatActivity() {
     private val syncProjectId = "%%PROJECT_ID%%"
     private val syncSupabaseUrl = "%%SUPABASE_URL%%"
     private val syncAnonKey = "%%SUPABASE_ANON_KEY%%"
-    private val syncPollIntervalMs: Long = 30000L
+    private val syncPollIntervalMs: Long = 8000L
     private var lastSignalAt: String = ""
+    private var syncSignalInitialized: Boolean = false
     private val syncHandler = Handler(Looper.getMainLooper())
     private val syncRunnable = object : Runnable {
         override fun run() {
@@ -456,15 +457,21 @@ class MainActivity : AppCompatActivity() {
                     val match = Regex("\"created_at\"\\s*:\\s*\"([^\"]+)\"").find(body)
                     val ts = match?.groupValues?.get(1) ?: ""
                     if (ts.isNotEmpty() && ts != lastSignalAt) {
-                        val previous = lastSignalAt
+                        val wasInitialized = syncSignalInitialized
                         lastSignalAt = ts
-                        if (previous.isNotEmpty()) {
+                        syncSignalInitialized = true
+                        // Reload on any new signal we observe after the first poll.
+                        // (First poll just establishes a baseline so we don't reload on launch.)
+                        if (wasInitialized) {
                             syncHandler.post {
                                 try {
                                     if (::webView.isInitialized && isNetworkAvailable()) webView.reload()
                                 } catch (_: Exception) {}
                             }
                         }
+                    } else if (ts.isEmpty()) {
+                        // No signals yet — still mark baseline so the first ever signal triggers a reload.
+                        syncSignalInitialized = true
                     }
                 }
                 conn.disconnect()
