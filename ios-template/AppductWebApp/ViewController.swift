@@ -18,8 +18,9 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
     private let syncProjectId = "%%PROJECT_ID%%"
     private let syncSupabaseUrl = "%%SUPABASE_URL%%"
     private let syncAnonKey = "%%SUPABASE_ANON_KEY%%"
-    private let syncPollInterval: TimeInterval = 30
+    private let syncPollInterval: TimeInterval = 8
     private var lastSignalAt: String = ""
+    private var syncSignalInitialized: Bool = false
     private var syncTimer: Timer?
 
     override func viewDidLoad() {
@@ -129,11 +130,14 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
                   let range = Range(match.range(at: 1), in: body) else { return }
             let ts = String(body[range])
             if !ts.isEmpty && ts != self.lastSignalAt {
-                let previous = self.lastSignalAt
+                let wasInitialized = self.syncSignalInitialized
                 self.lastSignalAt = ts
-                if !previous.isEmpty {
+                self.syncSignalInitialized = true
+                if wasInitialized {
                     DispatchQueue.main.async { self.webView?.reload() }
                 }
+            } else if ts.isEmpty {
+                self.syncSignalInitialized = true
             }
         }.resume()
     }
