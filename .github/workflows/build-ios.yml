@@ -41,6 +41,18 @@ on:
         description: 'app-store | ad-hoc | enterprise | development'
         required: false
         default: 'ad-hoc'
+      project_id:
+        description: 'Appduct project ID for sync polling'
+        required: false
+        default: ''
+      supabase_url:
+        description: 'Supabase URL for sync polling'
+        required: false
+        default: ''
+      supabase_anon_key:
+        description: 'Supabase anon key for sync polling'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -84,6 +96,9 @@ jobs:
           TEAM_ID="${{ secrets.IOS_TEAM_ID }}"
           PP_NAME="${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}"
           EXPORT_METHOD="${{ inputs.export_method }}"
+          PROJECT_ID="${{ inputs.project_id }}"
+          SUPABASE_URL_VAL="${{ inputs.supabase_url }}"
+          SUPABASE_ANON_KEY_VAL="${{ inputs.supabase_anon_key }}"
 
           find build-ios -type f \( -name "*.swift" -o -name "*.plist" -o -name "*.pbxproj" -o -name "*.storyboard" \) | while read f; do
             sed -i '' "s|%%APP_NAME%%|${APP_NAME}|g" "$f" || true
@@ -96,6 +111,9 @@ jobs:
             sed -i '' "s|%%TEAM_ID%%|${TEAM_ID}|g" "$f" || true
             sed -i '' "s|%%PROVISIONING_PROFILE_NAME%%|${PP_NAME}|g" "$f" || true
             sed -i '' "s|%%EXPORT_METHOD%%|${EXPORT_METHOD}|g" "$f" || true
+            sed -i '' "s|%%PROJECT_ID%%|${PROJECT_ID}|g" "$f" || true
+            sed -i '' "s|%%SUPABASE_URL%%|${SUPABASE_URL_VAL}|g" "$f" || true
+            sed -i '' "s|%%SUPABASE_ANON_KEY%%|${SUPABASE_ANON_KEY_VAL}|g" "$f" || true
           done
 
       - name: Download app icon
