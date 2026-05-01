@@ -14,6 +14,14 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
     private var lastBackgroundedAt: Date?
     private let resumeReloadThreshold: TimeInterval = 10
 
+    // Push-style sync polling
+    private let syncProjectId = "%%PROJECT_ID%%"
+    private let syncSupabaseUrl = "%%SUPABASE_URL%%"
+    private let syncAnonKey = "%%SUPABASE_ANON_KEY%%"
+    private let syncPollInterval: TimeInterval = 30
+    private var lastSignalAt: String = ""
+    private var syncTimer: Timer?
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = UIColor(hex: headerColorHex) ?? .systemBackground
@@ -21,6 +29,7 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
         setupWebView()
         setupProgressView()
         loadInitialURL()
+        startSyncPolling()
     }
 
     private func setupWebView() {
@@ -65,6 +74,7 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
 
     @objc private func appDidEnterBackground() {
         lastBackgroundedAt = Date()
+        stopSyncPolling()
     }
 
     @objc private func appWillEnterForeground() {
@@ -73,10 +83,59 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
             "(function(){try{document.dispatchEvent(new Event('visibilitychange'));window.dispatchEvent(new Event('focus'));}catch(e){}})();",
             completionHandler: nil
         )
+        startSyncPolling()
+        checkSyncSignal()
         // And do a full reload if the app was backgrounded for >10s.
         guard let bgAt = lastBackgroundedAt,
               Date().timeIntervalSince(bgAt) >= resumeReloadThreshold else { return }
         webView?.reload()
+    }
+
+    private func startSyncPolling() {
+        stopSyncPolling()
+        guard !syncProjectId.isEmpty, !syncProjectId.hasPrefix("%%"),
+              !syncSupabaseUrl.isEmpty, !syncSupabaseUrl.hasPrefix("%%"),
+              !syncAnonKey.isEmpty, !syncAnonKey.hasPrefix("%%") else { return }
+        syncTimer = Timer.scheduledTimer(withTimeInterval: syncPollInterval, repeats: true) { [weak self] _ in
+            self?.checkSyncSignal()
+        }
+    }
+
+    private func stopSyncPolling() {
+        syncTimer?.invalidate()
+        syncTimer = nil
+    }
+
+    /// Poll the backend for a reload signal published by the website. When a
+    /// newer signal exists than what we last saw, reload the WebView.
+    private func checkSyncSignal() {
+        guard !syncProjectId.isEmpty, !syncProjectId.hasPrefix("%%"),
+              !syncSupabaseUrl.isEmpty, !syncSupabaseUrl.hasPrefix("%%"),
+              !syncAnonKey.isEmpty, !syncAnonKey.hasPrefix("%%") else { return }
+        let base = syncSupabaseUrl.hasSuffix("/") ? String(syncSupabaseUrl.dropLast()) : syncSupabaseUrl
+        let urlStr = base + "/rest/v1/app_sync_signals?project_id=eq." + syncProjectId +
+            "&select=created_at&order=created_at.desc&limit=1"
+        guard let url = URL(string: urlStr) else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 5
+        req.setValue(syncAnonKey, forHTTPHeaderField: "apikey")
+        req.setValue("Bearer " + syncAnonKey, forHTTPHeaderField: "Authorization")
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self = self, let data = data,
+                  let body = String(data: data, encoding: .utf8) else { return }
+            let pattern = "\"created_at\"\\s*:\\s*\"([^\"]+)\""
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(in: body, range: NSRange(body.startIndex..., in: body)),
+                  let range = Range(match.range(at: 1), in: body) else { return }
+            let ts = String(body[range])
+            if !ts.isEmpty && ts != self.lastSignalAt {
+                let previous = self.lastSignalAt
+                self.lastSignalAt = ts
+                if !previous.isEmpty {
+                    DispatchQueue.main.async { self.webView?.reload() }
+                }
+            }
+        }.resume()
     }
 
     private func loadInitialURL() {
