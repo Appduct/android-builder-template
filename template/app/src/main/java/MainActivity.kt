@@ -25,6 +25,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
@@ -55,6 +57,21 @@ class MainActivity : AppCompatActivity() {
     // so this never produces a "Confirm Navigation" prompt.
     private var lastPauseTime: Long = 0L
     private val resumeReloadThresholdMs: Long = 10 * 1000L // 10 seconds
+
+    // Push-style sync: poll backend for a "reload" signal so content updates immediately
+    // when the website publishes new data — no need to wait for the user to background/resume.
+    private val syncProjectId = "%%PROJECT_ID%%"
+    private val syncSupabaseUrl = "%%SUPABASE_URL%%"
+    private val syncAnonKey = "%%SUPABASE_ANON_KEY%%"
+    private val syncPollIntervalMs: Long = 30000L
+    private var lastSignalAt: String = ""
+    private val syncHandler = Handler(Looper.getMainLooper())
+    private val syncRunnable = object : Runnable {
+        override fun run() {
+            checkSyncSignal()
+            syncHandler.postDelayed(this, syncPollIntervalMs)
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -401,6 +418,9 @@ class MainActivity : AppCompatActivity() {
                 try { webView.reload() } catch (_: Exception) {}
             }
         }
+        // Restart push-style sync polling
+        syncHandler.removeCallbacks(syncRunnable)
+        syncHandler.post(syncRunnable)
     }
 
     override fun onPause() {
@@ -408,6 +428,48 @@ class MainActivity : AppCompatActivity() {
         lastPauseTime = System.currentTimeMillis()
         // Persist cookies to disk so logins survive app restarts
         try { CookieManager.getInstance().flush() } catch (_: Exception) {}
+        syncHandler.removeCallbacks(syncRunnable)
+    }
+
+    /**
+     * Poll the backend for a reload signal. When a newer signal exists than the
+     * last one we observed, reload the WebView so users get fresh content within
+     * seconds of a backend-side update — without waiting for a backgrounding cycle.
+     */
+    private fun checkSyncSignal() {
+        if (syncProjectId.isEmpty() || syncProjectId.startsWith("%%") ||
+            syncSupabaseUrl.isEmpty() || syncSupabaseUrl.startsWith("%%") ||
+            syncAnonKey.isEmpty() || syncAnonKey.startsWith("%%")) return
+        Thread {
+            try {
+                val urlStr = syncSupabaseUrl.trimEnd('/') +
+                    "/rest/v1/app_sync_signals?project_id=eq." + syncProjectId +
+                    "&select=created_at&order=created_at.desc&limit=1"
+                val conn = URL(urlStr).openConnection() as HttpURLConnection
+                conn.connectTimeout = 5000
+                conn.readTimeout = 5000
+                conn.setRequestProperty("apikey", syncAnonKey)
+                conn.setRequestProperty("Authorization", "Bearer " + syncAnonKey)
+                conn.setRequestProperty("Accept", "application/json")
+                if (conn.responseCode in 200..299) {
+                    val body = conn.inputStream.bufferedReader().readText()
+                    val match = Regex("\"created_at\"\\s*:\\s*\"([^\"]+)\"").find(body)
+                    val ts = match?.groupValues?.get(1) ?: ""
+                    if (ts.isNotEmpty() && ts != lastSignalAt) {
+                        val previous = lastSignalAt
+                        lastSignalAt = ts
+                        if (previous.isNotEmpty()) {
+                            syncHandler.post {
+                                try {
+                                    if (::webView.isInitialized && isNetworkAvailable()) webView.reload()
+                                } catch (_: Exception) {}
+                            }
+                        }
+                    }
+                }
+                conn.disconnect()
+            } catch (_: Exception) {}
+        }.start()
     }
 
     /**
