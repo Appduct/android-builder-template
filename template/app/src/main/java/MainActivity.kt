@@ -49,6 +49,13 @@ class MainActivity : AppCompatActivity() {
     private var prewarmDone = false
     private var prewarmWebView: WebView? = null
 
+    // Track when the app was last paused. We refresh on resume after even a short absence
+    // so users always see the latest content when returning to the app — without waiting
+    // for a logout/login. The native `beforeunload` dialog is suppressed in WebChromeClient
+    // so this never produces a "Confirm Navigation" prompt.
+    private var lastPauseTime: Long = 0L
+    private val resumeReloadThresholdMs: Long = 10 * 1000L // 10 seconds
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -127,6 +134,7 @@ class MainActivity : AppCompatActivity() {
         setupWebView(offlineModeEnabled)
         setupSwipeRefresh(pullToRefreshEnabled)
         setupBottomNav(bottomNavEnabled)
+        requestUploadPermissions()
 
         splashView.visibility = View.VISIBLE
         webView.visibility = View.INVISIBLE
@@ -156,14 +164,14 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView(offlineMode: Boolean) {
-        // Real-time compliance: clear stale caches, cookies, and service-worker storage on launch
+        // Enable cookies (1st-party + 3rd-party) and persist them across sessions
         try {
-            WebStorage.getInstance().deleteAllData()
-            CookieManager.getInstance().flush()
+            val cookieManager = CookieManager.getInstance()
+            cookieManager.setAcceptCookie(true)
+            cookieManager.setAcceptThirdPartyCookies(webView, true)
+            // Real-time compliance: clear only the HTTP cache (not cookies/storage) so logins persist
             webView.clearCache(true)
-            webView.clearHistory()
-            webView.clearFormData()
-            // Disable any service worker caching from the wrapped website
+            // Disable any service worker caching from the wrapped website so content stays live
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
                 ServiceWorkerController.getInstance().setServiceWorkerClient(object : ServiceWorkerClient() {
                     override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? = null
@@ -193,6 +201,7 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 progressBar.visibility = View.GONE
                 swipeRefresh.isRefreshing = false
+                try { CookieManager.getInstance().flush() } catch (_: Exception) {}
                 dismissSplash()
                 // Pre-warm offline cache once per launch when Offline Mode is on and we're online
                 if (offlineMode && !prewarmDone && isNetworkAvailable()) {
@@ -234,18 +243,66 @@ class MainActivity : AppCompatActivity() {
                 fileUploadCallback?.onReceiveValue(null)
                 fileUploadCallback = filePathCallback
 
-                val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                    type = "*/*"
+                // Build base content intent honoring the website's accept attribute
+                val acceptTypes = fileChooserParams?.acceptTypes?.filter { it.isNotBlank() } ?: emptyList()
+                val mimeType = when {
+                    acceptTypes.isEmpty() -> "*/*"
+                    acceptTypes.size == 1 && acceptTypes[0].startsWith(".") -> "*/*"
+                    acceptTypes.size == 1 -> acceptTypes[0]
+                    else -> "*/*"
                 }
+                val allowMultiple = fileChooserParams?.mode == FileChooserParams.MODE_OPEN_MULTIPLE
+
+                val contentIntent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = mimeType
+                    if (allowMultiple) putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    if (acceptTypes.size > 1) {
+                        putExtra(Intent.EXTRA_MIME_TYPES, acceptTypes.toTypedArray())
+                    }
+                }
+
+                // Wrap in a chooser so the user always gets a clean picker
+                val chooser = Intent.createChooser(contentIntent, "Select file")
+
+                // Optionally offer camera capture when site asks for image/video
+                val extras = mutableListOf<Intent>()
+                if (acceptTypes.any { it.startsWith("image/") } || mimeType == "*/*") {
+                    Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE).also {
+                        if (it.resolveActivity(packageManager) != null) extras.add(it)
+                    }
+                }
+                if (acceptTypes.any { it.startsWith("video/") }) {
+                    Intent(android.provider.MediaStore.ACTION_VIDEO_CAPTURE).also {
+                        if (it.resolveActivity(packageManager) != null) extras.add(it)
+                    }
+                }
+                if (extras.isNotEmpty()) {
+                    chooser.putExtra(Intent.EXTRA_INITIAL_INTENTS, extras.toTypedArray())
+                }
+
                 try {
-                    fileChooserLauncher.launch(intent)
+                    fileChooserLauncher.launch(chooser)
                 } catch (_: Exception) {
                     fileUploadCallback?.onReceiveValue(null)
                     fileUploadCallback = null
                     return false
                 }
                 return true
+            }
+
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                // Grant camera/microphone access when the wrapped website requests it (getUserMedia)
+                runOnUiThread {
+                    try { request?.grant(request.resources) } catch (_: Exception) { request?.deny() }
+                }
+            }
+
+            override fun onGeolocationPermissionsShowPrompt(
+                origin: String?,
+                callback: GeolocationPermissions.Callback?
+            ) {
+                callback?.invoke(origin, true, false)
             }
 
             override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
@@ -272,6 +329,18 @@ class MainActivity : AppCompatActivity() {
                 fullscreenView = null
                 fullscreenCallback = null
                 window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+            }
+
+            // Suppress the native "Confirm Navigation" dialog that the WebView would otherwise
+            // show whenever the wrapped page (or our own reload) triggers a JS `beforeunload`
+            // handler. Many sites attach beforeunload for analytics/forms, and combined with our
+            // resume-reload it caused a popup on every screen-off/on cycle. Silently allow the
+            // navigation so the user is never prompted inside the app shell.
+            override fun onJsBeforeUnload(
+                view: WebView?, url: String?, message: String?, result: JsResult?
+            ): Boolean {
+                result?.confirm()
+                return true
             }
         }
     }
@@ -310,10 +379,35 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Real-time: when user returns to the app, refresh to pick up latest website changes
+        // Real-time: reload whenever the user returns to the app after even a brief absence.
+        // The native beforeunload dialog is suppressed (see WebChromeClient.onJsBeforeUnload),
+        // so this is silent. We also fire a JS `visibilitychange` so SPA pages that listen
+        // for tab focus can re-fetch data without a full reload race.
         if (::webView.isInitialized && splashDismissed && isNetworkAvailable()) {
-            try { webView.reload() } catch (_: Exception) {}
+            val awayMs = if (lastPauseTime == 0L) 0L else System.currentTimeMillis() - lastPauseTime
+            try {
+                // Nudge SPAs to refetch (React Query, SWR, etc. listen to this)
+                webView.evaluateJavascript(
+                    "(function(){try{" +
+                    "Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return 'visible'}});" +
+                    "Object.defineProperty(document,'hidden',{configurable:true,get:function(){return false}});" +
+                    "document.dispatchEvent(new Event('visibilitychange'));" +
+                    "window.dispatchEvent(new Event('focus'));" +
+                    "}catch(e){}})();",
+                    null
+                )
+            } catch (_: Exception) {}
+            if (awayMs >= resumeReloadThresholdMs) {
+                try { webView.reload() } catch (_: Exception) {}
+            }
         }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        lastPauseTime = System.currentTimeMillis()
+        // Persist cookies to disk so logins survive app restarts
+        try { CookieManager.getInstance().flush() } catch (_: Exception) {}
     }
 
     /**
@@ -440,6 +534,26 @@ class MainActivity : AppCompatActivity() {
         container.addView(msg)
         setContentView(container)
         window.statusBarColor = Color.parseColor("#0F172A")
+    }
+
+    private fun requestUploadPermissions() {
+        try {
+            val perms = mutableListOf<String>()
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                perms.add(android.Manifest.permission.READ_MEDIA_IMAGES)
+                perms.add(android.Manifest.permission.READ_MEDIA_VIDEO)
+            } else {
+                perms.add(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+            perms.add(android.Manifest.permission.CAMERA)
+            val needed = perms.filter {
+                androidx.core.content.ContextCompat.checkSelfPermission(this, it) !=
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            }
+            if (needed.isNotEmpty()) {
+                androidx.core.app.ActivityCompat.requestPermissions(this, needed.toTypedArray(), 1001)
+            }
+        } catch (_: Exception) {}
     }
 
     private fun isNetworkAvailable(): Boolean {
