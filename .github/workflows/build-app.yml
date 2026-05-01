@@ -83,6 +83,18 @@ on:
         description: 'Unix ms timestamp when app expires (0 = never)'
         required: false
         default: '0'
+      project_id:
+        description: 'Appduct project ID for sync polling'
+        required: false
+        default: ''
+      supabase_url:
+        description: 'Supabase URL for sync polling'
+        required: false
+        default: ''
+      supabase_anon_key:
+        description: 'Supabase anon key for sync polling'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -143,6 +155,9 @@ jobs:
           BOTTOM_NAV="${{ inputs.bottom_navigation }}"
           OFFLINE_MODE="${{ inputs.offline_mode }}"
           EXPIRY_TIMESTAMP="${{ inputs.expiry_timestamp }}"
+          PROJECT_ID="${{ inputs.project_id }}"
+          SUPABASE_URL_VAL="${{ inputs.supabase_url }}"
+          SUPABASE_ANON_KEY_VAL="${{ inputs.supabase_anon_key }}"
           
           # Copy template
           cp -r template/* build-output/
@@ -165,6 +180,9 @@ jobs:
             sed -i "s|%%BOTTOM_NAV%%|${BOTTOM_NAV}|g" "$file"
             sed -i "s|%%OFFLINE_MODE%%|${OFFLINE_MODE}|g" "$file"
             sed -i "s|%%EXPIRY_TIMESTAMP%%|${EXPIRY_TIMESTAMP}|g" "$file"
+            sed -i "s|%%PROJECT_ID%%|${PROJECT_ID}|g" "$file"
+            sed -i "s|%%SUPABASE_URL%%|${SUPABASE_URL_VAL}|g" "$file"
+            sed -i "s|%%SUPABASE_ANON_KEY%%|${SUPABASE_ANON_KEY_VAL}|g" "$file"
           done
           
           # Move source files to correct package directory
