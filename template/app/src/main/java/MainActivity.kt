@@ -777,6 +777,7 @@ class MainActivity : AppCompatActivity() {
             pendingGeoOrigin = null
             pendingGeoCallback = null
         }
+    }
 
     private fun isNetworkAvailable(): Boolean {
         val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
