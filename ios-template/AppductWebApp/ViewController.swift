@@ -18,10 +18,15 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
     private let syncProjectId = "%%PROJECT_ID%%"
     private let syncSupabaseUrl = "%%SUPABASE_URL%%"
     private let syncAnonKey = "%%SUPABASE_ANON_KEY%%"
-    private let syncPollInterval: TimeInterval = 8
+    private let syncPollInterval: TimeInterval = 5
     private var lastSignalAt: String = ""
     private var syncSignalInitialized: Bool = false
+    private var lastSyncReloadAt: Date = .distantPast
     private var syncTimer: Timer?
+    private var syncSocket: URLSessionWebSocketTask?
+    private var syncRef: Int = 1
+    private var syncHeartbeatTimer: Timer?
+    private lazy var syncUrlSession = URLSession(configuration: .default)
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -31,6 +36,8 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
         setupProgressView()
         loadInitialURL()
         startSyncPolling()
+        checkSyncSignal()
+        startSyncRealtime()
     }
 
     private func setupWebView() {
@@ -76,6 +83,7 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
     @objc private func appDidEnterBackground() {
         lastBackgroundedAt = Date()
         stopSyncPolling()
+        stopSyncRealtime()
     }
 
     @objc private func appWillEnterForeground() {
@@ -85,11 +93,12 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
             completionHandler: nil
         )
         startSyncPolling()
+        startSyncRealtime()
         checkSyncSignal()
         // And do a full reload if the app was backgrounded for >10s.
         guard let bgAt = lastBackgroundedAt,
               Date().timeIntervalSince(bgAt) >= resumeReloadThreshold else { return }
-        webView?.reload()
+        loadFreshWebsite()
     }
 
     private func startSyncPolling() {
@@ -100,6 +109,7 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
         syncTimer = Timer.scheduledTimer(withTimeInterval: syncPollInterval, repeats: true) { [weak self] _ in
             self?.checkSyncSignal()
         }
+        if let syncTimer { RunLoop.main.add(syncTimer, forMode: .common) }
     }
 
     private func stopSyncPolling() {
@@ -107,12 +117,79 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
         syncTimer = nil
     }
 
+    private func syncConfigured() -> Bool {
+        return !syncProjectId.isEmpty && !syncProjectId.hasPrefix("%%") &&
+               !syncSupabaseUrl.isEmpty && !syncSupabaseUrl.hasPrefix("%%") &&
+               !syncAnonKey.isEmpty && !syncAnonKey.hasPrefix("%%")
+    }
+
+    private func nextSyncRef() -> String {
+        syncRef += 1
+        return String(syncRef)
+    }
+
+    private func startSyncRealtime() {
+        guard syncConfigured(), syncSocket == nil else { return }
+        let base = syncSupabaseUrl.hasSuffix("/") ? String(syncSupabaseUrl.dropLast()) : syncSupabaseUrl
+        let wsBase = base.replacingOccurrences(of: "https://", with: "wss://")
+                         .replacingOccurrences(of: "http://", with: "ws://")
+        guard let encodedKey = syncAnonKey.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "\(wsBase)/realtime/v1/websocket?apikey=\(encodedKey)&vsn=1.0.0") else { return }
+        var req = URLRequest(url: url)
+        req.setValue(syncAnonKey, forHTTPHeaderField: "apikey")
+        req.setValue("Bearer " + syncAnonKey, forHTTPHeaderField: "Authorization")
+        let socket = syncUrlSession.webSocketTask(with: req)
+        syncSocket = socket
+        socket.resume()
+
+        let join = """
+        {"topic":"realtime:public:app_sync_signals","event":"phx_join","payload":{"config":{"broadcast":{"self":false},"presence":{"key":""},"postgres_changes":[{"event":"INSERT","schema":"public","table":"app_sync_signals","filter":"project_id=eq.\(syncProjectId)"}]},"access_token":"\(syncAnonKey)"},"ref":"\(nextSyncRef())"}
+        """
+        socket.send(.string(join)) { _ in }
+        receiveSyncMessage()
+        startSyncHeartbeat()
+        checkSyncSignal()
+    }
+
+    private func receiveSyncMessage() {
+        syncSocket?.receive { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success(let message):
+                if case .string(let text) = message,
+                   text.contains("\"event\":\"postgres_changes\""),
+                   text.contains(self.syncProjectId) {
+                    DispatchQueue.main.async { self.reloadFromSyncSignal() }
+                }
+                self.receiveSyncMessage()
+            case .failure:
+                self.stopSyncRealtime()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.startSyncRealtime() }
+            }
+        }
+    }
+
+    private func startSyncHeartbeat() {
+        syncHeartbeatTimer?.invalidate()
+        syncHeartbeatTimer = Timer.scheduledTimer(withTimeInterval: 25, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let heartbeat = "{\"topic\":\"phoenix\",\"event\":\"heartbeat\",\"payload\":{},\"ref\":\"\(self.nextSyncRef())\"}"
+            self.syncSocket?.send(.string(heartbeat)) { _ in }
+        }
+        if let syncHeartbeatTimer { RunLoop.main.add(syncHeartbeatTimer, forMode: .common) }
+    }
+
+    private func stopSyncRealtime() {
+        syncHeartbeatTimer?.invalidate()
+        syncHeartbeatTimer = nil
+        syncSocket?.cancel(with: .normalClosure, reason: nil)
+        syncSocket = nil
+    }
+
     /// Poll the backend for a reload signal published by the website. When a
     /// newer signal exists than what we last saw, reload the WebView.
     private func checkSyncSignal() {
-        guard !syncProjectId.isEmpty, !syncProjectId.hasPrefix("%%"),
-              !syncSupabaseUrl.isEmpty, !syncSupabaseUrl.hasPrefix("%%"),
-              !syncAnonKey.isEmpty, !syncAnonKey.hasPrefix("%%") else { return }
+        guard syncConfigured() else { return }
         let base = syncSupabaseUrl.hasSuffix("/") ? String(syncSupabaseUrl.dropLast()) : syncSupabaseUrl
         let urlStr = base + "/rest/v1/app_sync_signals?project_id=eq." + syncProjectId +
             "&select=created_at&order=created_at.desc&limit=1"
@@ -134,7 +211,7 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
                 self.lastSignalAt = ts
                 self.syncSignalInitialized = true
                 if wasInitialized {
-                    DispatchQueue.main.async { self.webView?.reload() }
+                    DispatchQueue.main.async { self.reloadFromSyncSignal() }
                 }
             } else if ts.isEmpty {
                 self.syncSignalInitialized = true
@@ -150,8 +227,38 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
         webView.load(req)
     }
 
+    private func loadFreshWebsite() {
+        guard var components = URLComponents(string: websiteURL) else {
+            webView?.reload()
+            return
+        }
+        var items = components.queryItems ?? []
+        items.removeAll { $0.name == "app_sync" }
+        items.append(URLQueryItem(name: "app_sync", value: String(Int(Date().timeIntervalSince1970 * 1000))))
+        components.queryItems = items
+        guard let url = components.url else {
+            webView?.reload()
+            return
+        }
+        var req = URLRequest(url: url)
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        req.setValue("no-cache, no-store, must-revalidate", forHTTPHeaderField: "Cache-Control")
+        req.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        req.setValue("0", forHTTPHeaderField: "Expires")
+        webView?.stopLoading()
+        WKWebsiteDataStore.default().removeData(ofTypes: [WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache], modifiedSince: .distantPast) { [weak self] in
+            DispatchQueue.main.async { self?.webView?.load(req) }
+        }
+    }
+
+    private func reloadFromSyncSignal() {
+        guard Date().timeIntervalSince(lastSyncReloadAt) >= 1.5 else { return }
+        lastSyncReloadAt = Date()
+        loadFreshWebsite()
+    }
+
     @objc private func handleRefresh() {
-        webView.reload()
+        loadFreshWebsite()
     }
 
     private func setupProgressView() {
@@ -202,6 +309,7 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
     }
 
     deinit {
+        stopSyncRealtime()
         webView?.removeObserver(self, forKeyPath: #keyPath(WKWebView.estimatedProgress))
     }
 }
