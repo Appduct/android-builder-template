@@ -175,7 +175,11 @@ class MainActivity : AppCompatActivity() {
         setupWebView(offlineModeEnabled)
         setupSwipeRefresh(pullToRefreshEnabled)
         setupBottomNav(bottomNavEnabled)
-        requestUploadPermissions()
+        // NOTE: We intentionally do NOT pre-request READ_MEDIA_IMAGES/VIDEO here.
+        // The WebView file chooser uses Storage Access Framework (ACTION_GET_CONTENT),
+        // which does not require those runtime permissions. Pre-requesting them on
+        // Android 14+ causes the "Allow access to more photos and videos" partial-access
+        // dialog to re-appear on every launch and screen flicker.
 
         splashView.visibility = View.VISIBLE
         webView.visibility = View.INVISIBLE
