@@ -25,8 +25,15 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response as OkHttpResponse
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import java.net.HttpURLConnection
+import java.net.URLEncoder
 import java.net.URL
+import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
@@ -47,6 +54,10 @@ class MainActivity : AppCompatActivity() {
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
     private lateinit var fileChooserLauncher: ActivityResultLauncher<Intent>
 
+    // Pending geolocation prompt state — held while we ask the OS for location permission
+    private var pendingGeoOrigin: String? = null
+    private var pendingGeoCallback: GeolocationPermissions.Callback? = null
+
     // Offline pre-warm cache state
     private var prewarmDone = false
     private var prewarmWebView: WebView? = null
@@ -63,9 +74,21 @@ class MainActivity : AppCompatActivity() {
     private val syncProjectId = "%%PROJECT_ID%%"
     private val syncSupabaseUrl = "%%SUPABASE_URL%%"
     private val syncAnonKey = "%%SUPABASE_ANON_KEY%%"
-    private val syncPollIntervalMs: Long = 8000L
+    private val syncPollIntervalMs: Long = 5000L
     private var lastSignalAt: String = ""
     private var syncSignalInitialized: Boolean = false
+    private var lastSyncReloadAt: Long = 0L
+    private var syncSocket: WebSocket? = null
+    private var syncRefCounter: Int = 1
+    private val syncHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build()
+    }
+    private val syncHeartbeatRunnable = object : Runnable {
+        override fun run() {
+            syncSocket?.send("""{"topic":"phoenix","event":"heartbeat","payload":{},"ref":"${nextSyncRef()}"}""")
+            syncHandler.postDelayed(this, 25000L)
+        }
+    }
     private val syncHandler = Handler(Looper.getMainLooper())
     private val syncRunnable = object : Runnable {
         override fun run() {
@@ -167,6 +190,10 @@ class MainActivity : AppCompatActivity() {
             dismissSplash()
             showError("No internet connection. Please check your network and try again.")
         }
+
+        syncHandler.removeCallbacks(syncRunnable)
+        syncHandler.post(syncRunnable)
+        startSyncRealtime()
     }
 
     private fun dismissSplash() {
@@ -191,6 +218,7 @@ class MainActivity : AppCompatActivity() {
             webView.clearCache(true)
             // Disable any service worker caching from the wrapped website so content stays live
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                ServiceWorkerController.getInstance().serviceWorkerWebSettings.cacheMode = WebSettings.LOAD_NO_CACHE
                 ServiceWorkerController.getInstance().setServiceWorkerClient(object : ServiceWorkerClient() {
                     override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? = null
                 })
@@ -320,7 +348,32 @@ class MainActivity : AppCompatActivity() {
                 origin: String?,
                 callback: GeolocationPermissions.Callback?
             ) {
-                callback?.invoke(origin, true, false)
+                // Grant the WebView's per-origin permission, then make sure the
+                // OS-level location permission is granted too — otherwise the
+                // wrapped site reports "Location Unavailable".
+                pendingGeoOrigin = origin
+                pendingGeoCallback = callback
+                val fine = androidx.core.content.ContextCompat.checkSelfPermission(
+                    this@MainActivity, android.Manifest.permission.ACCESS_FINE_LOCATION
+                )
+                val coarse = androidx.core.content.ContextCompat.checkSelfPermission(
+                    this@MainActivity, android.Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+                if (fine == android.content.pm.PackageManager.PERMISSION_GRANTED ||
+                    coarse == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    callback?.invoke(origin, true, false)
+                    pendingGeoOrigin = null
+                    pendingGeoCallback = null
+                } else {
+                    androidx.core.app.ActivityCompat.requestPermissions(
+                        this@MainActivity,
+                        arrayOf(
+                            android.Manifest.permission.ACCESS_FINE_LOCATION,
+                            android.Manifest.permission.ACCESS_COARSE_LOCATION
+                        ),
+                        2002
+                    )
+                }
             }
 
             override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
@@ -368,7 +421,7 @@ class MainActivity : AppCompatActivity() {
         if (!enabled) return
         swipeRefresh.setColorSchemeColors(resources.getColor(R.color.colorPrimary, theme))
         swipeRefresh.setOnRefreshListener {
-            if (isNetworkAvailable()) { webView.reload() }
+            if (isNetworkAvailable()) { loadFreshWebsite() }
             else { swipeRefresh.isRefreshing = false; showError("No internet connection.") }
         }
     }
@@ -382,7 +435,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<ImageButton>(R.id.navForward).setOnClickListener {
             if (webView.canGoForward()) webView.goForward()
         }
-        findViewById<ImageButton>(R.id.navRefresh).setOnClickListener { webView.reload() }
+        findViewById<ImageButton>(R.id.navRefresh).setOnClickListener { loadFreshWebsite() }
         findViewById<ImageButton>(R.id.navHome).setOnClickListener { loadUrl() }
     }
 
@@ -393,6 +446,42 @@ class MainActivity : AppCompatActivity() {
             "Expires" to "0"
         )
         webView.loadUrl(websiteUrl, headers)
+    }
+
+    private fun loadFreshWebsite() {
+        try {
+            webView.stopLoading()
+            webView.clearCache(true)
+            webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+            val currentUrl = webView.url ?: websiteUrl
+            val parsed = Uri.parse(currentUrl)
+            val builder = parsed.buildUpon().clearQuery()
+            for (name in parsed.queryParameterNames) {
+                if (name != "app_sync") {
+                    parsed.getQueryParameters(name).forEach { value -> builder.appendQueryParameter(name, value) }
+                }
+            }
+            val freshUrl = builder.appendQueryParameter("app_sync", System.currentTimeMillis().toString()).build().toString()
+            val headers = hashMapOf(
+                "Cache-Control" to "no-cache, no-store, must-revalidate",
+                "Pragma" to "no-cache",
+                "Expires" to "0"
+            )
+            webView.loadUrl(freshUrl, headers)
+        } catch (_: Exception) {
+            try { webView.reload() } catch (_: Exception) {}
+        }
+    }
+
+    private fun reloadFromSyncSignal() {
+        val now = System.currentTimeMillis()
+        if (now - lastSyncReloadAt < 1500L) return
+        lastSyncReloadAt = now
+        syncHandler.post {
+            try {
+                if (::webView.isInitialized && isNetworkAvailable()) loadFreshWebsite()
+            } catch (_: Exception) {}
+        }
     }
 
     override fun onResume() {
@@ -416,12 +505,13 @@ class MainActivity : AppCompatActivity() {
                 )
             } catch (_: Exception) {}
             if (awayMs >= resumeReloadThresholdMs) {
-                try { webView.reload() } catch (_: Exception) {}
+                try { loadFreshWebsite() } catch (_: Exception) {}
             }
         }
         // Restart push-style sync polling
         syncHandler.removeCallbacks(syncRunnable)
         syncHandler.post(syncRunnable)
+        startSyncRealtime()
     }
 
     override fun onPause() {
@@ -429,7 +519,62 @@ class MainActivity : AppCompatActivity() {
         lastPauseTime = System.currentTimeMillis()
         // Persist cookies to disk so logins survive app restarts
         try { CookieManager.getInstance().flush() } catch (_: Exception) {}
+        stopSyncRealtime()
         syncHandler.removeCallbacks(syncRunnable)
+    }
+
+    private fun nextSyncRef(): String = (syncRefCounter++).toString()
+
+    private fun syncConfigured(): Boolean =
+        !(syncProjectId.isEmpty() || syncProjectId.startsWith("%%") ||
+          syncSupabaseUrl.isEmpty() || syncSupabaseUrl.startsWith("%%") ||
+          syncAnonKey.isEmpty() || syncAnonKey.startsWith("%%"))
+
+    private fun startSyncRealtime() {
+        if (!syncConfigured() || syncSocket != null) return
+        try {
+            val wsBase = syncSupabaseUrl.trimEnd('/').replace("https://", "wss://").replace("http://", "ws://")
+            val encodedKey = URLEncoder.encode(syncAnonKey, "UTF-8")
+            val request = Request.Builder()
+                .url("$wsBase/realtime/v1/websocket?apikey=$encodedKey&vsn=1.0.0")
+                .addHeader("apikey", syncAnonKey)
+                .addHeader("Authorization", "Bearer $syncAnonKey")
+                .build()
+            syncSocket = syncHttpClient.newWebSocket(request, object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: OkHttpResponse) {
+                    val ref = nextSyncRef()
+                    webSocket.send("""{"topic":"realtime:public:app_sync_signals","event":"phx_join","payload":{"config":{"broadcast":{"self":false},"presence":{"key":""},"postgres_changes":[{"event":"INSERT","schema":"public","table":"app_sync_signals","filter":"project_id=eq.$syncProjectId"}]},"access_token":"$syncAnonKey"},"ref":"$ref"}""")
+                    syncHandler.removeCallbacks(syncHeartbeatRunnable)
+                    syncHandler.postDelayed(syncHeartbeatRunnable, 25000L)
+                    checkSyncSignal()
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    if (text.contains("\"event\":\"postgres_changes\"") && text.contains(syncProjectId)) {
+                        reloadFromSyncSignal()
+                    }
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: OkHttpResponse?) {
+                    syncSocket = null
+                    syncHandler.removeCallbacks(syncHeartbeatRunnable)
+                    syncHandler.postDelayed({ startSyncRealtime() }, 5000L)
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    syncSocket = null
+                    syncHandler.removeCallbacks(syncHeartbeatRunnable)
+                }
+            })
+        } catch (_: Exception) {
+            syncSocket = null
+        }
+    }
+
+    private fun stopSyncRealtime() {
+        syncHandler.removeCallbacks(syncHeartbeatRunnable)
+        try { syncSocket?.close(1000, "paused") } catch (_: Exception) {}
+        syncSocket = null
     }
 
     /**
@@ -438,9 +583,7 @@ class MainActivity : AppCompatActivity() {
      * seconds of a backend-side update — without waiting for a backgrounding cycle.
      */
     private fun checkSyncSignal() {
-        if (syncProjectId.isEmpty() || syncProjectId.startsWith("%%") ||
-            syncSupabaseUrl.isEmpty() || syncSupabaseUrl.startsWith("%%") ||
-            syncAnonKey.isEmpty() || syncAnonKey.startsWith("%%")) return
+        if (!syncConfigured()) return
         Thread {
             try {
                 val urlStr = syncSupabaseUrl.trimEnd('/') +
@@ -462,13 +605,7 @@ class MainActivity : AppCompatActivity() {
                         syncSignalInitialized = true
                         // Reload on any new signal we observe after the first poll.
                         // (First poll just establishes a baseline so we don't reload on launch.)
-                        if (wasInitialized) {
-                            syncHandler.post {
-                                try {
-                                    if (::webView.isInitialized && isNetworkAvailable()) webView.reload()
-                                } catch (_: Exception) {}
-                            }
-                        }
+                        if (wasInitialized) reloadFromSyncSignal()
                     } else if (ts.isEmpty()) {
                         // No signals yet — still mark baseline so the first ever signal triggers a reload.
                         syncSignalInitialized = true
@@ -624,6 +761,22 @@ class MainActivity : AppCompatActivity() {
             }
         } catch (_: Exception) {}
     }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 2002) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults.any { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+            try {
+                pendingGeoCallback?.invoke(pendingGeoOrigin, granted, false)
+            } catch (_: Exception) {}
+            pendingGeoOrigin = null
+            pendingGeoCallback = null
+        }
 
     private fun isNetworkAvailable(): Boolean {
         val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
