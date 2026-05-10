@@ -257,12 +257,6 @@ jobs:
       - name: Setup signing
         run: |
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > build-output/release.keystore
-
-           keytool -list -v \
-          -keystore build-output/release.keystore \
-          -alias "${{ secrets.KEY_ALIAS }}" \
-          -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
-          | grep -E "SHA1|SHA256"
           
           cat >> build-output/local.properties << EOF
           storeFile=../release.keystore
