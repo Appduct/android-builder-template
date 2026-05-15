@@ -53,6 +53,11 @@ class MainActivity : AppCompatActivity() {
 
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
     private lateinit var fileChooserLauncher: ActivityResultLauncher<Intent>
+    // Set true while the system file/camera picker is in the foreground so onResume()
+    // does NOT reload the page (which would discard the in-progress form/upload state
+    // and bounce the user back to the dashboard).
+    private var isPickingFile: Boolean = false
+    private var pickerLaunchedAt: Long = 0L
 
     // Pending geolocation prompt state — held while we ask the OS for location permission
     private var pendingGeoOrigin: String? = null
@@ -61,6 +66,7 @@ class MainActivity : AppCompatActivity() {
     // Offline pre-warm cache state
     private var prewarmDone = false
     private var prewarmWebView: WebView? = null
+    private var triedCacheFallback = false
 
     // Track when the app was last paused. We refresh on resume after even a short absence
     // so users always see the latest content when returning to the app — without waiting
@@ -105,18 +111,38 @@ class MainActivity : AppCompatActivity() {
         fileChooserLauncher = registerForActivityResult(
             ActivityResultContracts.StartActivityForResult()
         ) { result ->
-            if (result.resultCode == Activity.RESULT_OK) {
-                val data = result.data
-                val resultUris: Array<Uri>? = if (data?.clipData != null) {
-                    Array(data.clipData!!.itemCount) { i -> data.clipData!!.getItemAt(i).uri }
+            try {
+                if (result.resultCode == Activity.RESULT_OK) {
+                    val data = result.data
+                    val resultUris: Array<Uri>? = if (data?.clipData != null) {
+                        Array(data.clipData!!.itemCount) { i -> data.clipData!!.getItemAt(i).uri }
+                    } else {
+                        data?.data?.let { arrayOf(it) }
+                    }
+                    fileUploadCallback?.onReceiveValue(resultUris ?: arrayOf())
                 } else {
-                    data?.data?.let { arrayOf(it) }
+                    // User cancelled — must signal cancellation to the WebView so the
+                    // <input type="file"> control resets cleanly. Never throw.
+                    fileUploadCallback?.onReceiveValue(null)
                 }
-                fileUploadCallback?.onReceiveValue(resultUris ?: arrayOf())
-            } else {
-                fileUploadCallback?.onReceiveValue(null)
+            } catch (e: Exception) {
+                // Surface the real error to the page instead of silently dropping it,
+                // and keep the WebView responsive.
+                try { fileUploadCallback?.onReceiveValue(null) } catch (_: Exception) {}
+                try {
+                    android.widget.Toast.makeText(
+                        this,
+                        "Upload error: ${e.message ?: e.javaClass.simpleName}",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                } catch (_: Exception) {}
+            } finally {
+                fileUploadCallback = null
+                // Clear the picker flag on the next tick so onResume (which fires
+                // immediately after the picker closes) skips the resume-reload.
+                isPickingFile = false
+                pickerLaunchedAt = 0L
             }
-            fileUploadCallback = null
         }
 
         // Dark mode
@@ -164,6 +190,7 @@ class MainActivity : AppCompatActivity() {
             webView.visibility = View.VISIBLE
             splashView.visibility = View.VISIBLE
             splashDismissed = false
+            triedCacheFallback = false
             loadUrl()
         }
 
@@ -189,10 +216,11 @@ class MainActivity : AppCompatActivity() {
         } else if (offlineModeEnabled) {
             // Try cached version
             webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+            triedCacheFallback = true
             loadUrl()
         } else {
             dismissSplash()
-            showError("No internet connection. Please check your network and try again.")
+            showError("Please check your internet connection and try again.")
         }
 
         syncHandler.removeCallbacks(syncRunnable)
@@ -263,13 +291,14 @@ class MainActivity : AppCompatActivity() {
                 if (request?.isForMainFrame == true) {
                     progressBar.visibility = View.GONE
                     swipeRefresh.isRefreshing = false
-                    if (offlineMode) {
+                    if (offlineMode && !triedCacheFallback) {
                         // Try loading from cache as fallback
+                        triedCacheFallback = true
                         webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
                         webView.reload()
                     } else {
                         dismissSplash()
-                        showError("Failed to load the page. Please check your connection and try again.")
+                        showError("Please check your internet connection and try again.")
                     }
                 }
             }
@@ -332,10 +361,21 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 try {
+                    isPickingFile = true
+                    pickerLaunchedAt = System.currentTimeMillis()
                     fileChooserLauncher.launch(chooser)
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    isPickingFile = false
+                    pickerLaunchedAt = 0L
                     fileUploadCallback?.onReceiveValue(null)
                     fileUploadCallback = null
+                    try {
+                        android.widget.Toast.makeText(
+                            this@MainActivity,
+                            "Could not open file picker: ${e.message ?: e.javaClass.simpleName}",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    } catch (_: Exception) {}
                     return false
                 }
                 return true
@@ -426,7 +466,7 @@ class MainActivity : AppCompatActivity() {
         swipeRefresh.setColorSchemeColors(resources.getColor(R.color.colorPrimary, theme))
         swipeRefresh.setOnRefreshListener {
             if (isNetworkAvailable()) { loadFreshWebsite() }
-            else { swipeRefresh.isRefreshing = false; showError("No internet connection.") }
+            else { swipeRefresh.isRefreshing = false; showError("Please check your internet connection and try again.") }
         }
     }
 
@@ -478,6 +518,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun reloadFromSyncSignal() {
+        // Never reload while the user is interacting with the system file/camera
+        // picker — it would discard the in-progress upload.
+        if (isPickingFile) return
         val now = System.currentTimeMillis()
         if (now - lastSyncReloadAt < 1500L) return
         lastSyncReloadAt = now
@@ -490,14 +533,22 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        // If we're returning from the system file/camera picker, do NOT reload the
+        // page — that would discard the in-progress upload, the form state, and
+        // bounce the user back to whatever route the SPA defaults to (often the
+        // dashboard). The fileChooserLauncher callback fires right after this and
+        // delivers the picked URIs to the WebView's <input type="file">.
+        if (isPickingFile) {
+            // Restart sync polling but skip the reload-on-resume path.
+            syncHandler.removeCallbacks(syncRunnable)
+            syncHandler.post(syncRunnable)
+            startSyncRealtime()
+            return
+        }
         // Real-time: reload whenever the user returns to the app after even a brief absence.
-        // The native beforeunload dialog is suppressed (see WebChromeClient.onJsBeforeUnload),
-        // so this is silent. We also fire a JS `visibilitychange` so SPA pages that listen
-        // for tab focus can re-fetch data without a full reload race.
         if (::webView.isInitialized && splashDismissed && isNetworkAvailable()) {
             val awayMs = if (lastPauseTime == 0L) 0L else System.currentTimeMillis() - lastPauseTime
             try {
-                // Nudge SPAs to refetch (React Query, SWR, etc. listen to this)
                 webView.evaluateJavascript(
                     "(function(){try{" +
                     "Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return 'visible'}});" +
@@ -521,7 +572,6 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         lastPauseTime = System.currentTimeMillis()
-        // Persist cookies to disk so logins survive app restarts
         try { CookieManager.getInstance().flush() } catch (_: Exception) {}
         stopSyncRealtime()
         syncHandler.removeCallbacks(syncRunnable)
@@ -714,6 +764,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showError(message: String) {
+        try {
+            webView.stopLoading()
+            // Clear any native error page (which would otherwise reveal the URL)
+            webView.loadUrl("about:blank")
+        } catch (_: Exception) {}
         webView.visibility = View.GONE
         splashView.visibility = View.GONE
         errorView.visibility = View.VISIBLE
