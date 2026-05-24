@@ -233,6 +233,7 @@ jobs:
         if: inputs.app_icon_url != ''
         run: |
           ICON_URL="${{ inputs.app_icon_url }}"
+          ICON_BG="${{ inputs.header_color }}"
           mkdir -p build-output/app/src/main/res/mipmap-xxxhdpi
           mkdir -p build-output/app/src/main/res/mipmap-xxhdpi
           mkdir -p build-output/app/src/main/res/mipmap-xhdpi
@@ -240,16 +241,20 @@ jobs:
           mkdir -p build-output/app/src/main/res/mipmap-mdpi
           
           # Download and resize icon for each density
-          curl -sL "$ICON_URL" -o /tmp/icon_original.png
+          curl -fsSL --max-time 30 "$ICON_URL" -o /tmp/icon_original.img || true
           
           # Install imagemagick
           sudo apt-get install -y imagemagick > /dev/null 2>&1
-          
-          convert /tmp/icon_original.png -resize 192x192 build-output/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
-          convert /tmp/icon_original.png -resize 144x144 build-output/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
-          convert /tmp/icon_original.png -resize 96x96 build-output/app/src/main/res/mipmap-xhdpi/ic_launcher.png
-          convert /tmp/icon_original.png -resize 72x72 build-output/app/src/main/res/mipmap-hdpi/ic_launcher.png
-          convert /tmp/icon_original.png -resize 48x48 build-output/app/src/main/res/mipmap-mdpi/ic_launcher.png
+
+          if ! convert /tmp/icon_original.img -resize 192x192 build-output/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png 2>/tmp/icon_convert_error.log; then
+            echo "Icon download was not a valid image; generating a default icon instead."
+            convert -size 1024x1024 xc:"$ICON_BG" /tmp/icon_original.img
+            convert /tmp/icon_original.img -resize 192x192 build-output/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          fi
+          convert /tmp/icon_original.img -resize 144x144 build-output/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+          convert /tmp/icon_original.img -resize 96x96 build-output/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+          convert /tmp/icon_original.img -resize 72x72 build-output/app/src/main/res/mipmap-hdpi/ic_launcher.png
+          convert /tmp/icon_original.img -resize 48x48 build-output/app/src/main/res/mipmap-mdpi/ic_launcher.png
           
           # Copy as round icons too
           for dir in xxxhdpi xxhdpi xhdpi hdpi mdpi; do
