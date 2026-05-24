@@ -44,6 +44,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var splashView: View
     private lateinit var fullscreenContainer: FrameLayout
     private lateinit var bottomNav: LinearLayout
+    private var landingView: androidx.recyclerview.widget.RecyclerView? = null
+
+    // Multi-link landing page + custom bottom-nav tabs (templated at build time)
+    private val landingEnabled: Boolean = %%LANDING_ENABLED%%
+    private val landingLayoutPref: String = "%%LANDING_LAYOUT%%"
+    private val navTabsEnabled: Boolean = %%NAV_TABS_ENABLED%%
+
 
     private val websiteUrl = "%%WEBSITE_URL%%"
     private val expiryTimestamp: Long = %%EXPIRY_TIMESTAMP%%L
@@ -73,7 +80,9 @@ class MainActivity : AppCompatActivity() {
     // for a logout/login. The native `beforeunload` dialog is suppressed in WebChromeClient
     // so this never produces a "Confirm Navigation" prompt.
     private var lastPauseTime: Long = 0L
-    private val resumeReloadThresholdMs: Long = 10 * 1000L // 10 seconds
+    // Only refresh on resume after long absences. Short screen-off / app-switch cycles
+    // must NOT reload (would disrupt videos, forms, uploads, ongoing reads).
+    private val resumeReloadThresholdMs: Long = 5 * 60 * 1000L // 5 minutes
 
     // Push-style sync: poll backend for a "reload" signal so content updates immediately
     // when the website publishes new data — no need to wait for the user to background/resume.
@@ -167,6 +176,10 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {}
         }
 
+        // Keep the screen on while the app is in the foreground — videos, long reads, and
+        // forms should never put the device to sleep mid-activity.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         setContentView(R.layout.activity_main)
 
         // Trial expiry check (0 = no expiry)
@@ -183,6 +196,7 @@ class MainActivity : AppCompatActivity() {
         splashView = findViewById(R.id.splashView)
         fullscreenContainer = findViewById(R.id.fullscreenContainer)
         bottomNav = findViewById(R.id.bottomNav)
+        landingView = findViewById(R.id.landingView)
 
         val retryButton = findViewById<View>(R.id.retryButton)
         retryButton.setOnClickListener {
@@ -208,24 +222,78 @@ class MainActivity : AppCompatActivity() {
         // Android 14+ causes the "Allow access to more photos and videos" partial-access
         // dialog to re-appear on every launch and screen flicker.
 
-        splashView.visibility = View.VISIBLE
-        webView.visibility = View.INVISIBLE
-
-        if (isNetworkAvailable()) {
-            loadUrl()
-        } else if (offlineModeEnabled) {
-            // Try cached version
-            webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
-            triedCacheFallback = true
-            loadUrl()
+        if (landingEnabled && setupLanding()) {
+            // Landing shown — skip auto-loading the website URL. Tile clicks load it.
         } else {
-            dismissSplash()
-            showError("Please check your internet connection and try again.")
+            splashView.visibility = View.VISIBLE
+            webView.visibility = View.INVISIBLE
+
+            if (isNetworkAvailable()) {
+                loadUrl()
+            } else if (offlineModeEnabled) {
+                // Try cached version
+                webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                triedCacheFallback = true
+                loadUrl()
+            } else {
+                dismissSplash()
+                showError("Please check your internet connection and try again.")
+            }
         }
+
 
         syncHandler.removeCallbacks(syncRunnable)
         syncHandler.post(syncRunnable)
         startSyncRealtime()
+
+        // Start a lightweight foreground service so Android keeps the app process
+        // alive when backgrounded (so reopening is instant and ongoing audio/state survives).
+        try {
+            val svc = Intent(this, KeepAliveService::class.java)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                startForegroundService(svc)
+            } else {
+                startService(svc)
+            }
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Detects whether the user has something in flight that a reload would disrupt:
+     * playing video/audio, fullscreen media, dirty form input, focused contentEditable,
+     * or an in-progress file picker. The result is delivered async on the UI thread.
+     */
+    private fun isUserBusy(callback: (Boolean) -> Unit) {
+        if (isPickingFile || fullscreenView != null) { callback(true); return }
+        if (!::webView.isInitialized) { callback(false); return }
+        val js = """(function(){try{
+            var m=document.querySelectorAll('video,audio');
+            for(var i=0;i<m.length;i++){if(!m[i].paused && !m[i].ended && m[i].currentTime>0)return 'busy';}
+            if(document.fullscreenElement)return 'busy';
+            var ae=document.activeElement;
+            if(ae){
+              var t=(ae.tagName||'').toLowerCase();
+              if(t==='input'||t==='textarea'||t==='select')return 'busy';
+              if(ae.isContentEditable)return 'busy';
+            }
+            var forms=document.querySelectorAll('form');
+            for(var j=0;j<forms.length;j++){
+              var els=forms[j].elements||[];
+              for(var k=0;k<els.length;k++){
+                var e=els[k];var ty=(e.type||'').toLowerCase();
+                if(ty==='hidden'||ty==='submit'||ty==='button')continue;
+                if(ty==='checkbox'||ty==='radio'){if(e.checked!==e.defaultChecked)return 'busy';}
+                else if(e.value!=null && e.defaultValue!=null && e.value!==e.defaultValue && String(e.value).length>0)return 'busy';
+              }
+            }
+            return 'idle';
+        }catch(e){return 'idle';}})();""".trimIndent()
+        try {
+            webView.evaluateJavascript(js) { value ->
+                val v = (value ?: "").replace("\"", "")
+                callback(v == "busy")
+            }
+        } catch (_: Exception) { callback(false) }
     }
 
     private fun dismissSplash() {
@@ -471,6 +539,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupBottomNav(enabled: Boolean) {
+        // When custom nav tabs are configured, replace the default 4-button nav
+        // with user-defined destinations.
+        if (navTabsEnabled && setupCustomNavTabs()) return
+
         bottomNav.visibility = if (enabled) View.VISIBLE else View.GONE
         if (!enabled) return
         findViewById<ImageButton>(R.id.navBack).setOnClickListener {
@@ -480,8 +552,124 @@ class MainActivity : AppCompatActivity() {
             if (webView.canGoForward()) webView.goForward()
         }
         findViewById<ImageButton>(R.id.navRefresh).setOnClickListener { loadFreshWebsite() }
-        findViewById<ImageButton>(R.id.navHome).setOnClickListener { loadUrl() }
+        findViewById<ImageButton>(R.id.navHome).setOnClickListener {
+            if (landingEnabled && landingView != null) showLanding()
+            else loadUrl()
+        }
     }
+
+    /** Returns true when custom tabs were rendered (and the default nav should NOT run). */
+    private fun setupCustomNavTabs(): Boolean {
+        val items = readJsonAssetArray("nav_tabs.json").take(5)
+        if (items.isEmpty()) { bottomNav.visibility = View.GONE; return true }
+        bottomNav.removeAllViews()
+        bottomNav.orientation = LinearLayout.HORIZONTAL
+        bottomNav.visibility = View.VISIBLE
+        for (item in items) {
+            val container = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = android.view.Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+                isClickable = true
+                isFocusable = true
+            }
+            val iconView = android.widget.ImageView(this).apply {
+                setImageResource(navIconRes(item["icon"] ?: "home"))
+                setColorFilter(Color.WHITE)
+                layoutParams = LinearLayout.LayoutParams(
+                    (24 * resources.displayMetrics.density).toInt(),
+                    (24 * resources.displayMetrics.density).toInt()
+                )
+            }
+            val label = TextView(this).apply {
+                text = item["label"] ?: ""
+                setTextColor(Color.WHITE)
+                textSize = 10f
+                gravity = android.view.Gravity.CENTER
+                setPadding(0, (2 * resources.displayMetrics.density).toInt(), 0, 0)
+            }
+            container.addView(iconView)
+            container.addView(label)
+            val url = item["url"] ?: ""
+            container.setOnClickListener {
+                if (url.isNotEmpty()) {
+                    showWebViewFromLanding()
+                    webView.loadUrl(url)
+                }
+            }
+            bottomNav.addView(container)
+        }
+        return true
+    }
+
+    private fun navIconRes(name: String): Int = when (name) {
+        "search" -> android.R.drawable.ic_menu_search
+        "menu" -> android.R.drawable.ic_menu_sort_by_size
+        "info" -> android.R.drawable.ic_dialog_info
+        "cart" -> android.R.drawable.ic_menu_add
+        "user" -> android.R.drawable.ic_menu_myplaces
+        else -> android.R.drawable.ic_menu_revert
+    }
+
+    /** Initialise the native landing page. Returns true when shown. */
+    private fun setupLanding(): Boolean {
+        val rv = landingView ?: return false
+        val items = readJsonAssetArray("multi_links.json")
+        if (items.isEmpty()) return false
+        val lm = when (landingLayoutPref) {
+            "grid3" -> androidx.recyclerview.widget.GridLayoutManager(this, 3)
+            "list" -> androidx.recyclerview.widget.LinearLayoutManager(this)
+            else -> androidx.recyclerview.widget.GridLayoutManager(this, 2)
+        }
+        rv.layoutManager = lm
+        rv.adapter = LandingAdapter(this, items) { url ->
+            showWebViewFromLanding()
+            webView.loadUrl(url)
+        }
+        // Hide splash + webview; show landing.
+        splashView.visibility = View.GONE
+        swipeRefresh.visibility = View.GONE
+        webView.visibility = View.GONE
+        rv.visibility = View.VISIBLE
+        splashDismissed = true
+        return true
+    }
+
+    private fun showWebViewFromLanding() {
+        landingView?.visibility = View.GONE
+        swipeRefresh.visibility = View.VISIBLE
+        webView.visibility = View.VISIBLE
+    }
+
+    private fun showLanding(): Boolean {
+        val rv = landingView ?: return false
+        try { webView.stopLoading(); webView.loadUrl("about:blank") } catch (_: Exception) {}
+        swipeRefresh.visibility = View.GONE
+        webView.visibility = View.GONE
+        errorView.visibility = View.GONE
+        rv.visibility = View.VISIBLE
+        return true
+    }
+
+    private fun readJsonAssetArray(name: String): List<Map<String, String>> {
+        val out = mutableListOf<Map<String, String>>()
+        try {
+            val text = assets.open(name).bufferedReader().use { it.readText() }
+            val arr = org.json.JSONArray(text)
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val m = mutableMapOf<String, String>()
+                val keys = o.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    m[k] = o.optString(k, "")
+                }
+                out.add(m)
+            }
+        } catch (_: Exception) {}
+        return out
+    }
+
 
     private fun loadUrl() {
         val headers = hashMapOf(
@@ -523,11 +711,16 @@ class MainActivity : AppCompatActivity() {
         if (isPickingFile) return
         val now = System.currentTimeMillis()
         if (now - lastSyncReloadAt < 1500L) return
-        lastSyncReloadAt = now
         syncHandler.post {
-            try {
-                if (::webView.isInitialized && isNetworkAvailable()) loadFreshWebsite()
-            } catch (_: Exception) {}
+            isUserBusy { busy ->
+                // Skip reload while user is mid-activity (playing media, typing in a form,
+                // fullscreen, etc.). The next sync poll will retry.
+                if (busy) return@isUserBusy
+                lastSyncReloadAt = System.currentTimeMillis()
+                try {
+                    if (::webView.isInitialized && isNetworkAvailable()) loadFreshWebsite()
+                } catch (_: Exception) {}
+            }
         }
     }
 
@@ -545,7 +738,6 @@ class MainActivity : AppCompatActivity() {
             startSyncRealtime()
             return
         }
-        // Real-time: reload whenever the user returns to the app after even a brief absence.
         if (::webView.isInitialized && splashDismissed && isNetworkAvailable()) {
             val awayMs = if (lastPauseTime == 0L) 0L else System.currentTimeMillis() - lastPauseTime
             try {
@@ -559,8 +751,14 @@ class MainActivity : AppCompatActivity() {
                     null
                 )
             } catch (_: Exception) {}
+            // Only reload after a long absence AND when nothing is in progress, so
+            // short screen-off / app-switch cycles never disrupt an ongoing process.
             if (awayMs >= resumeReloadThresholdMs) {
-                try { loadFreshWebsite() } catch (_: Exception) {}
+                isUserBusy { busy ->
+                    if (!busy) {
+                        try { loadFreshWebsite() } catch (_: Exception) {}
+                    }
+                }
             }
         }
         // Restart push-style sync polling
@@ -760,6 +958,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         try { prewarmWebView?.destroy() } catch (_: Exception) {}
         prewarmWebView = null
+        try { stopService(Intent(this, KeepAliveService::class.java)) } catch (_: Exception) {}
         super.onDestroy()
     }
 
@@ -858,7 +1057,15 @@ class MainActivity : AppCompatActivity() {
             window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
             return
         }
+        val deviceNavEnabled = %%DEVICE_NAVIGATION%%
+        if (!deviceNavEnabled) {
+            try {
+                android.widget.Toast.makeText(this, "Please use in-app navigation", android.widget.Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {}
+            return
+        }
         if (webView.canGoBack()) { webView.goBack() }
+        else if (landingEnabled && landingView != null && landingView?.visibility != View.VISIBLE) { showLanding() }
         else { @Suppress("DEPRECATION") super.onBackPressed() }
     }
 }
