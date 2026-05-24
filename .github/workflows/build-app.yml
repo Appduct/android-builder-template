@@ -79,6 +79,30 @@ on:
         description: 'Enable offline cache mode'
         required: false
         default: 'false'
+      device_navigation:
+        description: 'Allow device navigation (back gesture/button)'
+        required: false
+        default: 'true'
+      multi_links_json:
+        description: 'JSON array of landing page tiles ({title,imageUrl,url})'
+        required: false
+        default: '[]'
+      nav_tabs_json:
+        description: 'JSON array of custom bottom nav tabs ({label,icon,url})'
+        required: false
+        default: '[]'
+      landing_enabled:
+        description: 'Enable native multi-link landing page'
+        required: false
+        default: 'false'
+      landing_layout:
+        description: 'Landing layout: grid2 | grid3 | list'
+        required: false
+        default: 'grid2'
+      nav_tabs_enabled:
+        description: 'Enable custom bottom-nav tabs'
+        required: false
+        default: 'false'
       expiry_timestamp:
         description: 'Unix ms timestamp when app expires (0 = never)'
         required: false
@@ -111,10 +135,29 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Cache Gradle caches & wrapper
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Cache Android SDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.android/build-cache
+            ~/.android/cache
+          key: android-sdk-${{ runner.os }}-v1
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.5'
+          cache-read-only: false
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
@@ -154,6 +197,10 @@ jobs:
           PULL_TO_REFRESH="${{ inputs.pull_to_refresh }}"
           BOTTOM_NAV="${{ inputs.bottom_navigation }}"
           OFFLINE_MODE="${{ inputs.offline_mode }}"
+          DEVICE_NAVIGATION="${{ inputs.device_navigation }}"
+          LANDING_ENABLED="${{ inputs.landing_enabled }}"
+          LANDING_LAYOUT="${{ inputs.landing_layout }}"
+          NAV_TABS_ENABLED="${{ inputs.nav_tabs_enabled }}"
           EXPIRY_TIMESTAMP="${{ inputs.expiry_timestamp }}"
           PROJECT_ID="${{ inputs.project_id }}"
           SUPABASE_URL_VAL="${{ inputs.supabase_url }}"
@@ -179,6 +226,10 @@ jobs:
             sed -i "s|%%PULL_TO_REFRESH%%|${PULL_TO_REFRESH}|g" "$file"
             sed -i "s|%%BOTTOM_NAV%%|${BOTTOM_NAV}|g" "$file"
             sed -i "s|%%OFFLINE_MODE%%|${OFFLINE_MODE}|g" "$file"
+            sed -i "s|%%DEVICE_NAVIGATION%%|${DEVICE_NAVIGATION}|g" "$file"
+            sed -i "s|%%LANDING_ENABLED%%|${LANDING_ENABLED}|g" "$file"
+            sed -i "s|%%LANDING_LAYOUT%%|${LANDING_LAYOUT}|g" "$file"
+            sed -i "s|%%NAV_TABS_ENABLED%%|${NAV_TABS_ENABLED}|g" "$file"
             sed -i "s|%%EXPIRY_TIMESTAMP%%|${EXPIRY_TIMESTAMP}|g" "$file"
             sed -i "s|%%PROJECT_ID%%|${PROJECT_ID}|g" "$file"
             sed -i "s|%%SUPABASE_URL%%|${SUPABASE_URL_VAL}|g" "$file"
@@ -188,6 +239,9 @@ jobs:
           # Move source files to correct package directory
           mkdir -p "build-output/app/src/main/java/${PACKAGE_PATH}"
           mv build-output/app/src/main/java/MainActivity.kt "build-output/app/src/main/java/${PACKAGE_PATH}/MainActivity.kt"
+          if [ -f build-output/app/src/main/java/KeepAliveService.kt ]; then
+            mv build-output/app/src/main/java/KeepAliveService.kt "build-output/app/src/main/java/${PACKAGE_PATH}/KeepAliveService.kt"
+          fi
 
       - name: Ensure Gradle wrapper
         working-directory: build-output
@@ -254,9 +308,44 @@ jobs:
             fi
           done
 
+      - name: Write multi-link & nav-tab JSON assets + download tile images
+        env:
+          MULTI_LINKS_JSON: ${{ inputs.multi_links_json }}
+          NAV_TABS_JSON: ${{ inputs.nav_tabs_json }}
+        run: |
+          ASSETS_DIR="build-output/app/src/main/assets"
+          DRAWABLE_DIR="build-output/app/src/main/res/drawable"
+          mkdir -p "$ASSETS_DIR" "$DRAWABLE_DIR"
+          sudo apt-get install -y jq imagemagick > /dev/null 2>&1 || true
+
+          # Persist the raw JSON arrays so the Kotlin side can render them at runtime
+          printf '%s' "${MULTI_LINKS_JSON:-[]}" > "$ASSETS_DIR/multi_links.json"
+          printf '%s' "${NAV_TABS_JSON:-[]}" > "$ASSETS_DIR/nav_tabs.json"
+
+          # Download landing-page tile images (one drawable per item, indexed)
+          if [ "${MULTI_LINKS_JSON:-[]}" != "[]" ] && [ -n "${MULTI_LINKS_JSON:-}" ]; then
+            COUNT=$(echo "$MULTI_LINKS_JSON" | jq 'length' 2>/dev/null || echo 0)
+            i=0
+            while [ "$i" -lt "$COUNT" ]; do
+              URL=$(echo "$MULTI_LINKS_JSON" | jq -r ".[$i].imageUrl // \"\"" 2>/dev/null || echo "")
+              if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+                if curl -sL --max-time 30 "$URL" -o "/tmp/tile_${i}.img" && [ -s "/tmp/tile_${i}.img" ]; then
+                  convert "/tmp/tile_${i}.img" -resize 512x512^ -gravity center -extent 512x512 -quality 85 "${DRAWABLE_DIR}/tile_${i}.jpg" 2>/dev/null || true
+                fi
+              fi
+              i=$((i + 1))
+            done
+          fi
+
       - name: Setup signing
         run: |
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > build-output/release.keystore
+
+          keytool -list -v \
+      -keystore build-output/release.keystore \
+      -alias "${{ secrets.KEY_ALIAS }}" \
+      -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+      | grep -E "SHA1|SHA256"
           
           cat >> build-output/local.properties << EOF
           storeFile=../release.keystore
