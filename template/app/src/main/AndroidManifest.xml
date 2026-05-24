@@ -8,9 +8,16 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <!-- Media permissions intentionally omitted: WebView file chooser uses SAF (ACTION_GET_CONTENT)
-         which does not require READ_MEDIA_*. Declaring them caused Android 14's
-         "Allow access to more photos and videos" partial-access dialog to re-appear on every launch. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Media permissions intentionally omitted: the WebView file chooser uses the
+         Storage Access Framework (ACTION_GET_CONTENT / OpenDocument), which does not
+         require READ_MEDIA_* or READ_EXTERNAL_STORAGE. Declaring them caused Android 14's
+         "Allow access to more photos and videos" partial-access dialog to re-appear
+         on every launch. -->
+
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
@@ -23,6 +30,7 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar"
         android:usesCleartextTraffic="true"
+        android:largeHeap="true"
         android:networkSecurityConfig="@xml/network_security_config"
         android:requestLegacyExternalStorage="true">
 
@@ -41,5 +49,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".KeepAliveService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>
