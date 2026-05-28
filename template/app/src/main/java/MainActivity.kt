@@ -2,6 +2,7 @@ package %%PACKAGE_NAME%%
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -30,6 +31,7 @@ import okhttp3.Request
 import okhttp3.Response as OkHttpResponse
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
@@ -339,14 +341,28 @@ class MainActivity : AppCompatActivity() {
             useWideViewPort = true
             mediaPlaybackRequiresUserGesture = false
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            // Support target=_blank / window.open so we can route share-link popups to the OS
+            setSupportMultipleWindows(true)
+            javaScriptCanOpenWindowsAutomatically = true
         }
+        // Expose a native share bridge so navigator.share() opens the OS share sheet
+        try { webView.addJavascriptInterface(NativeShareBridge(), "AndroidShareBridge") } catch (_: Exception) {}
+
+
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                if (!url.isNullOrBlank() && handleExternalUrl(url)) {
+                    try { view?.stopLoading() } catch (_: Exception) {}
+                    try { view?.loadUrl("about:blank") } catch (_: Exception) {}
+                    return
+                }
                 progressBar.visibility = View.GONE
+                injectNativeShareShim(view)
             }
             override fun onPageFinished(view: WebView?, url: String?) {
                 progressBar.visibility = View.GONE
                 swipeRefresh.isRefreshing = false
+                injectNativeShareShim(view)
                 try { CookieManager.getInstance().flush() } catch (_: Exception) {}
                 dismissSplash()
                 // Pre-warm offline cache once per launch when Offline Mode is on and we're online
@@ -355,6 +371,7 @@ class MainActivity : AppCompatActivity() {
                     Handler(Looper.getMainLooper()).postDelayed({ prewarmOfflineCache() }, 1500)
                 }
             }
+
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 if (request?.isForMainFrame == true) {
                     progressBar.visibility = View.GONE
@@ -372,15 +389,48 @@ class MainActivity : AppCompatActivity() {
             }
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: return false
-                if (url.startsWith("http://") || url.startsWith("https://")) {
-                    return false
+                if (handleExternalUrl(url)) {
+                    try { view?.stopLoading() } catch (_: Exception) {}
+                    return true
                 }
-                try {
-                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                } catch (_: Exception) { }
-                return true
+                return false
+            }
+
+            @Suppress("DEPRECATION")
+            override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
+                if (url.isNullOrBlank()) return false
+                if (handleExternalUrl(url)) {
+                    try { view?.stopLoading() } catch (_: Exception) {}
+                    return true
+                }
+                return false
+            }
+
+            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                val url = request?.url?.toString() ?: return null
+                if (request.isForMainFrame && isBlockedExternalPage(url)) {
+                    runOnUiThread {
+                        try { view?.stopLoading() } catch (_: Exception) {}
+                        try { handleExternalUrl(url) } catch (_: Exception) {}
+                    }
+                    return emptyWebResponse()
+                }
+                return null
+            }
+
+            @Suppress("DEPRECATION")
+            override fun shouldInterceptRequest(view: WebView?, url: String?): WebResourceResponse? {
+                if (!url.isNullOrBlank() && isBlockedExternalPage(url)) {
+                    runOnUiThread {
+                        try { view?.stopLoading() } catch (_: Exception) {}
+                        try { handleExternalUrl(url) } catch (_: Exception) {}
+                    }
+                    return emptyWebResponse()
+                }
+                return null
             }
         }
+
         webView.webChromeClient = object : WebChromeClient() {
             override fun onShowFileChooser(
                 webView: WebView?,
@@ -525,8 +575,257 @@ class MainActivity : AppCompatActivity() {
                 result?.confirm()
                 return true
             }
+
+            // Handle window.open / target=_blank — most sites use these for share popups
+            // (WhatsApp/Twitter/Facebook intent links). Route them to the OS instead of
+            // opening an inner WebView.
+            override fun onCreateWindow(
+                view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?
+            ): Boolean {
+                try {
+                    val hitUrl = view?.hitTestResult?.extra
+                    if (!hitUrl.isNullOrBlank() && handleExternalUrl(hitUrl, forceExternal = true)) return false
+                } catch (_: Exception) {}
+                val tempWebView = WebView(this@MainActivity)
+                tempWebView.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(v: WebView?, request: WebResourceRequest?): Boolean {
+                        val url = request?.url?.toString() ?: return true
+                        handleExternalUrl(url, forceExternal = true)
+                        return true
+                    }
+                }
+                val transport = resultMsg?.obj as? WebView.WebViewTransport
+                transport?.webView = tempWebView
+                resultMsg?.sendToTarget()
+                return true
+            }
         }
     }
+
+    /**
+     * Decide whether a URL should leave the WebView (open in a native app / browser)
+     * or be loaded in-place. Returns true if it was handled externally and the WebView
+     * should NOT load it.
+     */
+    private fun handleExternalUrl(url: String, forceExternal: Boolean = false): Boolean {
+        val lower = url.lowercase()
+        if (lower.startsWith("intent:")) return openIntentUri(url)
+        if (isWhatsAppUrl(url)) return openWhatsAppUrl(url)
+        if (isKnownExternalAppUrl(url)) return openExternalAppUrl(url)
+
+        // Always external: non-http schemes (mailto, tel, sms, whatsapp, intent, market, etc.)
+        val nonHttp = !lower.startsWith("http://") && !lower.startsWith("https://") && !lower.startsWith("about:") && !lower.startsWith("javascript:")
+        // Known share / external-app HTTPS URLs
+        val shareHosts = listOf(
+            "wa.me", "api.whatsapp.com/send", "web.whatsapp.com/send", "whatsapp.com/send", "chat.whatsapp.com",
+            "t.me/", "telegram.me/",
+            "twitter.com/intent", "x.com/intent",
+            "facebook.com/sharer", "facebook.com/dialog/share", "m.facebook.com/sharer",
+            "linkedin.com/sharing", "linkedin.com/shareArticle",
+            "pinterest.com/pin/create", "reddit.com/submit",
+            "mail.google.com/mail/?view=cm", "messenger.com/share"
+        )
+        val isShareUrl = shareHosts.any { lower.contains(it) }
+
+        if (nonHttp || isShareUrl || forceExternal) {
+            try {
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+            } catch (_: Exception) {
+                // No app can handle it — fall back to loading in WebView for http(s)
+                if (!nonHttp) return false
+            }
+            return true
+        }
+        return false
+    }
+
+    private fun isBlockedExternalPage(url: String): Boolean {
+        return isWhatsAppUrl(url) || isKnownExternalAppUrl(url)
+    }
+
+    private fun emptyWebResponse(): WebResourceResponse {
+        return WebResourceResponse(
+            "text/html",
+            "UTF-8",
+            ByteArrayInputStream("".toByteArray())
+        )
+    }
+
+    private fun isWhatsAppUrl(url: String): Boolean {
+        return try {
+            val uri = Uri.parse(url)
+            val scheme = (uri.scheme ?: "").lowercase()
+            val host = (uri.host ?: "").lowercase().removePrefix("www.")
+            scheme == "whatsapp" || host == "wa.me" || host == "api.whatsapp.com" ||
+                host == "web.whatsapp.com" || host == "whatsapp.com" || host == "chat.whatsapp.com"
+        } catch (_: Exception) {
+            url.lowercase().contains("whatsapp") || url.lowercase().contains("wa.me/")
+        }
+    }
+
+    private fun isKnownExternalAppUrl(url: String): Boolean {
+        return try {
+            val uri = Uri.parse(url)
+            val scheme = (uri.scheme ?: "").lowercase()
+            val host = (uri.host ?: "").lowercase().removePrefix("www.").removePrefix("m.").removePrefix("mobile.")
+            if (scheme in setOf("fb", "fb-messenger", "tg", "twitter", "x", "linkedin", "pinterest", "reddit")) return true
+            when (host) {
+                "t.me", "telegram.me", "telegram.dog", "twitter.com", "x.com",
+                "facebook.com", "messenger.com", "m.me", "linkedin.com",
+                "pinterest.com", "reddit.com" -> true
+                else -> false
+            }
+        } catch (_: Exception) {
+            val lower = url.lowercase()
+            listOf("t.me/", "telegram.me/", "twitter.com/intent", "x.com/intent", "facebook.com/sharer", "messenger.com", "linkedin.com/sharing", "pinterest.com/pin/create", "reddit.com/submit").any { lower.contains(it) }
+        }
+    }
+
+    private fun openExternalAppUrl(originalUrl: String): Boolean {
+        val uri = try { Uri.parse(originalUrl) } catch (_: Exception) { null }
+        val lower = originalUrl.lowercase()
+        val candidates = mutableListOf<Intent>()
+        fun addView(url: String, pkg: String? = null) {
+            candidates.add(Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply { if (!pkg.isNullOrBlank()) setPackage(pkg) })
+        }
+
+        when {
+            lower.contains("t.me/") || lower.contains("telegram.me/") || lower.startsWith("tg:") -> {
+                val text = uri?.getQueryParameter("text") ?: uri?.getQueryParameter("url") ?: originalUrl
+                addView(originalUrl, "org.telegram.messenger")
+                addView("tg://msg?text=${Uri.encode(text)}", "org.telegram.messenger")
+                addView("tg://resolve?domain=${Uri.encode(uri?.lastPathSegment ?: "")}", "org.telegram.messenger")
+            }
+            lower.contains("twitter.com/intent") || lower.contains("x.com/intent") || lower.startsWith("twitter:") || lower.startsWith("x:") -> {
+                val text = listOfNotNull(uri?.getQueryParameter("text"), uri?.getQueryParameter("url")).joinToString(" ").ifBlank { originalUrl }
+                addView("twitter://post?message=${Uri.encode(text)}", "com.twitter.android")
+                addView(originalUrl, "com.twitter.android")
+            }
+            lower.contains("facebook.com/sharer") || lower.contains("facebook.com/dialog/share") || lower.startsWith("fb:") -> {
+                val shareUrl = uri?.getQueryParameter("u") ?: uri?.getQueryParameter("href") ?: originalUrl
+                addView("fb://facewebmodal/f?href=${Uri.encode(shareUrl)}", "com.facebook.katana")
+                addView(originalUrl, "com.facebook.katana")
+            }
+            lower.contains("messenger.com") || lower.contains("m.me/") || lower.startsWith("fb-messenger:") -> {
+                addView(originalUrl, "com.facebook.orca")
+                addView(originalUrl)
+            }
+            lower.contains("linkedin.com/sharing") || lower.contains("linkedin.com/sharearticle") || lower.startsWith("linkedin:") -> {
+                addView(originalUrl, "com.linkedin.android")
+                addView(originalUrl)
+            }
+            lower.contains("pinterest.com/pin/create") || lower.startsWith("pinterest:") -> {
+                addView(originalUrl, "com.pinterest")
+                addView(originalUrl)
+            }
+            lower.contains("reddit.com/submit") || lower.startsWith("reddit:") -> {
+                addView(originalUrl, "com.reddit.frontpage")
+                addView(originalUrl)
+            }
+            else -> addView(originalUrl)
+        }
+
+        for (intent in candidates) {
+            try {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                return true
+            } catch (_: ActivityNotFoundException) {
+            } catch (_: SecurityException) {
+            } catch (_: Exception) {}
+        }
+        return true
+    }
+
+    private fun openWhatsAppUrl(originalUrl: String): Boolean {
+        val packages = listOf("com.whatsapp", "com.whatsapp.w4b")
+        val candidates = mutableListOf<Intent>()
+        val directUrl = toWhatsAppDeepLink(originalUrl)
+        val sendText = extractWhatsAppText(originalUrl)
+
+        for (pkg in packages) {
+            candidates.add(Intent(Intent.ACTION_VIEW, Uri.parse(directUrl)).setPackage(pkg))
+            candidates.add(Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, sendText)
+                setPackage(pkg)
+            })
+        }
+        candidates.add(Intent(Intent.ACTION_VIEW, Uri.parse("whatsapp://send?text=${Uri.encode(sendText)}")))
+        candidates.add(Intent(Intent.ACTION_VIEW, Uri.parse(directUrl)))
+
+        for (intent in candidates) {
+            try {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                return true
+            } catch (_: ActivityNotFoundException) {
+            } catch (_: SecurityException) {
+            } catch (_: Exception) {}
+        }
+
+        // WhatsApp-specific URLs must never fall back into this app's WebView. If the app
+        // is unavailable, leave the app via Play Store/browser instead of showing the
+        // api.whatsapp.com "download WhatsApp" page inside the wrapper.
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.whatsapp")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            })
+        } catch (_: Exception) {
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.whatsapp")).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                })
+            } catch (_: Exception) {}
+        }
+        return true
+    }
+
+    private fun extractWhatsAppText(originalUrl: String): String {
+        return try {
+            val uri = Uri.parse(originalUrl)
+            val text = uri.getQueryParameter("text")
+            if (!text.isNullOrBlank()) text else websiteUrl
+        } catch (_: Exception) {
+            websiteUrl
+        }
+    }
+
+    private fun toWhatsAppDeepLink(originalUrl: String): String {
+        return try {
+            val uri = Uri.parse(originalUrl)
+            if ((uri.scheme ?: "").lowercase() == "whatsapp") return originalUrl
+            val host = (uri.host ?: "").lowercase().removePrefix("www.")
+            val builder = Uri.Builder().scheme("whatsapp").authority("send")
+            val phone = when {
+                !uri.getQueryParameter("phone").isNullOrBlank() -> uri.getQueryParameter("phone")
+                host == "wa.me" && uri.pathSegments.isNotEmpty() -> uri.pathSegments.firstOrNull()
+                else -> null
+            }?.filter { it.isDigit() }
+            val text = uri.getQueryParameter("text")
+            if (!phone.isNullOrBlank()) builder.appendQueryParameter("phone", phone)
+            if (!text.isNullOrBlank()) builder.appendQueryParameter("text", text)
+            builder.build().toString()
+        } catch (_: Exception) {
+            originalUrl
+        }
+    }
+
+    private fun openIntentUri(url: String): Boolean {
+        try {
+            val intent = Intent.parseUri(url, Intent.URI_INTENT_SCHEME).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                removeCategory(Intent.CATEGORY_BROWSABLE)
+                removeExtra("browser_fallback_url")
+            }
+            startActivity(intent)
+        } catch (_: Exception) {}
+        return true
+    }
+
 
     private fun setupSwipeRefresh(enabled: Boolean) {
         swipeRefresh.isEnabled = enabled
@@ -961,6 +1260,68 @@ class MainActivity : AppCompatActivity() {
         try { stopService(Intent(this, KeepAliveService::class.java)) } catch (_: Exception) {}
         super.onDestroy()
     }
+
+    /**
+     * JS bridge exposed as `AndroidShareBridge` — opens the Android system share
+     * sheet so users get WhatsApp / Messages / Email / etc. as native options
+     * when the wrapped site calls navigator.share().
+     */
+    inner class NativeShareBridge {
+        @android.webkit.JavascriptInterface
+        fun share(title: String?, text: String?, url: String?) {
+            runOnUiThread {
+                try {
+                    val parts = mutableListOf<String>()
+                    if (!text.isNullOrBlank()) parts.add(text)
+                    if (!url.isNullOrBlank()) parts.add(url)
+                    val body = parts.joinToString("\n").ifEmpty { url ?: title ?: "" }
+                    val intent = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        if (!title.isNullOrBlank()) putExtra(Intent.EXTRA_SUBJECT, title)
+                        putExtra(Intent.EXTRA_TEXT, body)
+                    }
+                    val chooser = Intent.createChooser(intent, title?.ifBlank { "Share" } ?: "Share")
+                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(chooser)
+                } catch (_: Exception) {}
+            }
+        }
+
+        /** Force a URL to leave the WebView and open in its native app / browser. */
+        @android.webkit.JavascriptInterface
+        fun openExternal(url: String?) {
+            if (url.isNullOrBlank()) return
+            runOnUiThread {
+                try { handleExternalUrl(url, forceExternal = true) } catch (_: Exception) {}
+            }
+        }
+    }
+
+    /**
+     * Override navigator.share / canShare AND intercept share-link clicks + window.open,
+     * so the wrapped website's share button routes to the device's native share sheet
+     * or directly to the target app. WebView's shouldOverrideUrlLoading is not always
+     * invoked for JS-driven navigations, so we also pre-empt at the JS layer.
+     */
+    private fun injectNativeShareShim(view: WebView?) {
+        val js = "(function(){try{" +
+            "if(window.__appductShareShim)return;window.__appductShareShim=1;" +
+            "var b=window.AndroidShareBridge;if(!b)return;" +
+            "navigator.share=function(d){try{d=d||{};b.share(String(d.title||''),String(d.text||''),String(d.url||''));return Promise.resolve();}catch(e){return Promise.reject(e);}};" +
+            "navigator.canShare=function(){return true;};" +
+            "var SHARE_RE=/(^mailto:|^tel:|^sms:|^whatsapp:|^fb-messenger:|^tg:|^viber:|^intent:|^market:|^geo:|^skype:|wa\\.me\\/|api\\.whatsapp\\.com|web\\.whatsapp\\.com|whatsapp\\.com|chat\\.whatsapp\\.com|t\\.me\\/|telegram\\.me\\/|twitter\\.com\\/intent|x\\.com\\/intent|facebook\\.com\\/sharer|facebook\\.com\\/dialog\\/share|m\\.facebook\\.com\\/sharer|linkedin\\.com\\/sharing|linkedin\\.com\\/shareArticle|pinterest\\.com\\/pin\\/create|reddit\\.com\\/submit|mail\\.google\\.com\\/mail\\/\\?view=cm|messenger\\.com\\/share)/i;" +
+            "function isShare(u){try{u=String(u||'');return !!u&&SHARE_RE.test(u);}catch(e){return false;}}" +
+            "function ext(u,ev){try{if(isShare(u)){if(ev){ev.preventDefault();ev.stopImmediatePropagation();ev.stopPropagation();}b.openExternal(String(u));return true;}}catch(e){}return false;}" +
+            "var _open=window.open;window.open=function(u,n,f){try{if(isShare(u)){b.openExternal(String(u));return null;}}catch(e){}return _open?_open.apply(window,arguments):null;};" +
+            "document.addEventListener('click',function(ev){try{var t=ev.target;while(t&&t!==document){if(t.tagName==='A'&&t.href){if(ext(t.href,ev))return false;break;}t=t.parentNode;}}catch(e){}},true);" +
+            "document.addEventListener('submit',function(ev){try{var f=ev.target;if(f&&f.action&&ext(f.action,ev))return false;}catch(e){}},true);" +
+            "var _assign=Location.prototype.assign;Location.prototype.assign=function(u){if(ext(u,null))return;return _assign.call(this,u);};" +
+            "var _replace=Location.prototype.replace;Location.prototype.replace=function(u){if(ext(u,null))return;return _replace.call(this,u);};" +
+            "}catch(e){}})();"
+        try { view?.evaluateJavascript(js, null) } catch (_: Exception) {}
+    }
+
+
 
     private fun showError(message: String) {
         try {
