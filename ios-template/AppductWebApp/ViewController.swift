@@ -299,13 +299,46 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UISc
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if let url = navigationAction.request.url,
-           let scheme = url.scheme?.lowercased(),
-           ["tel", "mailto", "sms", "whatsapp"].contains(scheme) {
-            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+           handleExternalShareURL(url) {
             decisionHandler(.cancel)
             return
         }
         decisionHandler(.allow)
+    }
+
+    private func handleExternalShareURL(_ url: URL) -> Bool {
+        let scheme = url.scheme?.lowercased() ?? ""
+        let host = (url.host ?? "").lowercased().replacingOccurrences(of: "www.", with: "")
+        if ["tel", "mailto", "sms", "whatsapp", "fb-messenger", "tg", "twitter", "fb", "linkedin", "pinterest", "reddit"].contains(scheme) {
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            return true
+        }
+
+        let externalHosts: Set<String> = [
+            "wa.me", "api.whatsapp.com", "web.whatsapp.com", "whatsapp.com", "chat.whatsapp.com",
+            "t.me", "telegram.me", "twitter.com", "x.com", "facebook.com", "m.facebook.com",
+            "messenger.com", "m.me", "linkedin.com", "pinterest.com", "reddit.com"
+        ]
+        guard externalHosts.contains(host) else { return false }
+
+        if let whatsappURL = whatsappDeepLink(from: url), ["wa.me", "api.whatsapp.com", "web.whatsapp.com", "whatsapp.com", "chat.whatsapp.com"].contains(host) {
+            UIApplication.shared.open(whatsappURL, options: [:]) { opened in
+                if !opened { UIApplication.shared.open(url, options: [:], completionHandler: nil) }
+            }
+        } else {
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+        }
+        return true
+    }
+
+    private func whatsappDeepLink(from url: URL) -> URL? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        let text = components.queryItems?.first(where: { $0.name == "text" })?.value ?? websiteURL
+        components.scheme = "whatsapp"
+        components.host = "send"
+        components.path = ""
+        components.queryItems = [URLQueryItem(name: "text", value: text)]
+        return components.url
     }
 
     deinit {
