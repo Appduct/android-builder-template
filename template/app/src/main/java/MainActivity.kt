@@ -1454,10 +1454,10 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {}
             return
         }
-        // When landing is the home and we're on a tile-loaded page, prefer returning to landing
-        // over exiting the app, even if WebView history has entries from the tile click.
+        // When landing is the home and we're on a tile-loaded page, always return directly to
+        // the landing page on a single back press (do NOT walk WebView history first).
         if (landingEnabled && landingContainer?.visibility != View.VISIBLE) {
-            if (webView.canGoBack()) { webView.goBack() } else { showLanding() }
+            showLanding()
         } else if (webView.canGoBack()) { webView.goBack() }
         else { @Suppress("DEPRECATION") super.onBackPressed() }
     }
