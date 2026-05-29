@@ -46,15 +46,15 @@
             android:id="@+id/landingIntro"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:paddingTop="28dp"
-            android:paddingBottom="20dp"
+            android:paddingTop="56dp"
+            android:paddingBottom="24dp"
             android:paddingLeft="28dp"
             android:paddingRight="28dp"
-            android:textSize="14sp"
+            android:textSize="16sp"
             android:textColor="#4B5563"
             android:gravity="center"
             android:textAlignment="center"
-            android:lineSpacingExtra="3dp"
+            android:lineSpacingExtra="4dp"
             android:visibility="gone" />
 
         <androidx.recyclerview.widget.RecyclerView
