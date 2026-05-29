@@ -32,15 +32,33 @@
     </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
 
     <!-- Native multi-link landing page (hidden unless landing feature enabled) -->
-    <androidx.recyclerview.widget.RecyclerView
-        android:id="@+id/landingView"
+    <LinearLayout
+        android:id="@+id/landingContainer"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:padding="8dp"
-        android:clipToPadding="false"
+        android:orientation="vertical"
         android:visibility="gone"
         app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintBottom_toTopOf="@+id/bottomNav" />
+        app:layout_constraintBottom_toTopOf="@+id/bottomNav">
+
+        <TextView
+            android:id="@+id/landingIntro"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:padding="16dp"
+            android:textSize="14sp"
+            android:lineSpacingExtra="2dp"
+            android:visibility="gone" />
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/landingView"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:padding="8dp"
+            android:clipToPadding="false" />
+
+    </LinearLayout>
 
     <!-- Bottom Navigation Bar -->
     <LinearLayout
