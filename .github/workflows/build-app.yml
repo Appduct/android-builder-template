@@ -304,10 +304,12 @@ jobs:
           EF="${EXTRA_FEATURES_JSON:-{}}"
           MULTI_LINKS_JSON=$(echo "$EF" | jq -c '.multi_links // []' 2>/dev/null || echo '[]')
           NAV_TABS_JSON=$(echo "$EF" | jq -c '.nav_tabs // []' 2>/dev/null || echo '[]')
+          LANDING_INTRO=$(echo "$EF" | jq -r '.landing_intro // ""' 2>/dev/null || echo '')
 
           # Persist the raw JSON arrays so the Kotlin side can render them at runtime
           printf '%s' "$MULTI_LINKS_JSON" > "$ASSETS_DIR/multi_links.json"
           printf '%s' "$NAV_TABS_JSON" > "$ASSETS_DIR/nav_tabs.json"
+          printf '%s' "$LANDING_INTRO" > "$ASSETS_DIR/landing_intro.txt"
 
           # Download landing-page tile images (one drawable per item, indexed)
           if [ "$MULTI_LINKS_JSON" != "[]" ] && [ -n "$MULTI_LINKS_JSON" ]; then
