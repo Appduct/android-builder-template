@@ -955,7 +955,7 @@ class MainActivity : AppCompatActivity() {
                 splashView.startAnimation(fadeOut)
                 Handler(Looper.getMainLooper()).postDelayed({ splashView.visibility = View.GONE }, 420)
             }
-        }, 1200)
+        }, 3000)
         return true
     }
 
@@ -1454,8 +1454,11 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {}
             return
         }
-        if (webView.canGoBack()) { webView.goBack() }
-        else if (landingEnabled && landingView != null && landingView?.visibility != View.VISIBLE) { showLanding() }
+        // When landing is the home and we're on a tile-loaded page, prefer returning to landing
+        // over exiting the app, even if WebView history has entries from the tile click.
+        if (landingEnabled && landingContainer?.visibility != View.VISIBLE) {
+            if (webView.canGoBack()) { webView.goBack() } else { showLanding() }
+        } else if (webView.canGoBack()) { webView.goBack() }
         else { @Suppress("DEPRECATION") super.onBackPressed() }
     }
 }
