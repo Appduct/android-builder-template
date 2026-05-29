@@ -47,6 +47,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullscreenContainer: FrameLayout
     private lateinit var bottomNav: LinearLayout
     private var landingView: androidx.recyclerview.widget.RecyclerView? = null
+    private var landingContainer: View? = null
+    private var landingIntroView: TextView? = null
 
     // Multi-link landing page + custom bottom-nav tabs (templated at build time)
     private val landingEnabled: Boolean = %%LANDING_ENABLED%%
@@ -199,6 +201,8 @@ class MainActivity : AppCompatActivity() {
         fullscreenContainer = findViewById(R.id.fullscreenContainer)
         bottomNav = findViewById(R.id.bottomNav)
         landingView = findViewById(R.id.landingView)
+        landingContainer = findViewById(R.id.landingContainer)
+        landingIntroView = findViewById(R.id.landingIntro)
 
         val retryButton = findViewById<View>(R.id.retryButton)
         retryButton.setOnClickListener {
@@ -913,6 +917,7 @@ class MainActivity : AppCompatActivity() {
     /** Initialise the native landing page. Returns true when shown. */
     private fun setupLanding(): Boolean {
         val rv = landingView ?: return false
+        val container = landingContainer ?: return false
         val items = readJsonAssetArray("multi_links.json")
         if (items.isEmpty()) return false
         val lm = when (landingLayoutPref) {
@@ -925,29 +930,53 @@ class MainActivity : AppCompatActivity() {
             showWebViewFromLanding()
             webView.loadUrl(url)
         }
-        // Hide splash + webview; show landing.
-        splashView.visibility = View.GONE
+
+        // Optional intro/description text loaded from assets so we don't have to
+        // escape multi-line / quoted content through sed at build time.
+        val intro = readAssetText("landing_intro.txt")
+        landingIntroView?.let { tv ->
+            if (intro.isNotBlank()) { tv.text = intro; tv.visibility = View.VISIBLE }
+            else { tv.visibility = View.GONE }
+        }
+
+        // Hide webview but KEEP the splash showing — it should still play the
+        // user's uploaded splash image first, then fade into the landing page.
         swipeRefresh.visibility = View.GONE
         webView.visibility = View.GONE
-        rv.visibility = View.VISIBLE
-        splashDismissed = true
+        container.visibility = View.VISIBLE
+        splashView.visibility = View.VISIBLE
+        splashDismissed = false
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (!splashDismissed) {
+                splashDismissed = true
+                val fadeOut = AlphaAnimation(1f, 0f)
+                fadeOut.duration = 400
+                fadeOut.fillAfter = true
+                splashView.startAnimation(fadeOut)
+                Handler(Looper.getMainLooper()).postDelayed({ splashView.visibility = View.GONE }, 420)
+            }
+        }, 1200)
         return true
     }
 
     private fun showWebViewFromLanding() {
-        landingView?.visibility = View.GONE
+        landingContainer?.visibility = View.GONE
         swipeRefresh.visibility = View.VISIBLE
         webView.visibility = View.VISIBLE
     }
 
     private fun showLanding(): Boolean {
-        val rv = landingView ?: return false
+        val container = landingContainer ?: return false
         try { webView.stopLoading(); webView.loadUrl("about:blank") } catch (_: Exception) {}
         swipeRefresh.visibility = View.GONE
         webView.visibility = View.GONE
         errorView.visibility = View.GONE
-        rv.visibility = View.VISIBLE
+        container.visibility = View.VISIBLE
         return true
+    }
+
+    private fun readAssetText(name: String): String {
+        return try { assets.open(name).bufferedReader().use { it.readText() } } catch (_: Exception) { "" }
     }
 
     private fun readJsonAssetArray(name: String): List<Map<String, String>> {
