@@ -61,6 +61,7 @@ class MainActivity : AppCompatActivity() {
     private var splashDismissed = false
     private var fullscreenView: View? = null
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
+    private var landingRootHistoryPending = false
 
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
     private lateinit var fileChooserLauncher: ActivityResultLauncher<Intent>
@@ -368,6 +369,7 @@ class MainActivity : AppCompatActivity() {
                 swipeRefresh.isRefreshing = false
                 injectNativeShareShim(view)
                 try { CookieManager.getInstance().flush() } catch (_: Exception) {}
+                resetLandingRootHistoryIfNeeded(url)
                 dismissSplash()
                 // Pre-warm offline cache once per launch when Offline Mode is on and we're online
                 if (offlineMode && !prewarmDone && isNetworkAvailable()) {
@@ -960,6 +962,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showWebViewFromLanding() {
+        landingRootHistoryPending = landingEnabled
         landingContainer?.visibility = View.GONE
         swipeRefresh.visibility = View.VISIBLE
         webView.visibility = View.VISIBLE
@@ -967,11 +970,30 @@ class MainActivity : AppCompatActivity() {
 
     private fun showLanding(): Boolean {
         val container = landingContainer ?: return false
+        landingRootHistoryPending = false
         try { webView.stopLoading(); webView.loadUrl("about:blank") } catch (_: Exception) {}
         swipeRefresh.visibility = View.GONE
         webView.visibility = View.GONE
         errorView.visibility = View.GONE
         container.visibility = View.VISIBLE
+        return true
+    }
+
+    private fun resetLandingRootHistoryIfNeeded(url: String?) {
+        if (!landingRootHistoryPending || !landingEnabled || landingContainer?.visibility == View.VISIBLE) return
+        if (url.isNullOrBlank() || url == "about:blank") return
+        try { webView.clearHistory() } catch (_: Exception) {}
+        landingRootHistoryPending = false
+    }
+
+    private fun handleLandingBack(): Boolean {
+        if (!landingEnabled || landingContainer?.visibility == View.VISIBLE) return false
+        if (landingRootHistoryPending) {
+            showLanding()
+            return true
+        }
+        val historyIndex = try { webView.copyBackForwardList().currentIndex } catch (_: Exception) { 0 }
+        if (historyIndex > 0 && webView.canGoBack()) webView.goBack() else showLanding()
         return true
     }
 
@@ -1454,10 +1476,10 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {}
             return
         }
-        // When landing is the home and we're on a tile-loaded page, always return directly to
-        // the landing page on a single back press (do NOT walk WebView history first).
-        if (landingEnabled && landingContainer?.visibility != View.VISIBLE) {
-            showLanding()
+        // Landing is native home: navigate normally inside linked pages, but once the
+        // linked page is back at its first entry, the next device Back returns home.
+        if (handleLandingBack()) {
+            return
         } else if (webView.canGoBack()) { webView.goBack() }
         else { @Suppress("DEPRECATION") super.onBackPressed() }
     }
