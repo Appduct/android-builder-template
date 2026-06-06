@@ -61,7 +61,7 @@ class MainActivity : AppCompatActivity() {
     private var splashDismissed = false
     private var fullscreenView: View? = null
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
-    private var landingRootHistoryPending = false
+    private var landingBaselineIndex = -1
 
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
     private lateinit var fileChooserLauncher: ActivityResultLauncher<Intent>
@@ -962,7 +962,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showWebViewFromLanding() {
-        landingRootHistoryPending = landingEnabled
+        // Capture the history index BEFORE loading the linked URL so we can later
+        // tell whether the user is still on the first linked page (back -> landing)
+        // or has navigated deeper inside it (back -> webView.goBack()).
+        landingBaselineIndex = try { webView.copyBackForwardList().currentIndex } catch (_: Exception) { -1 }
         landingContainer?.visibility = View.GONE
         swipeRefresh.visibility = View.VISIBLE
         webView.visibility = View.VISIBLE
@@ -970,7 +973,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun showLanding(): Boolean {
         val container = landingContainer ?: return false
-        landingRootHistoryPending = false
         try { webView.stopLoading(); webView.loadUrl("about:blank") } catch (_: Exception) {}
         swipeRefresh.visibility = View.GONE
         webView.visibility = View.GONE
@@ -980,20 +982,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun resetLandingRootHistoryIfNeeded(url: String?) {
-        if (!landingRootHistoryPending || !landingEnabled || landingContainer?.visibility == View.VISIBLE) return
-        if (url.isNullOrBlank() || url == "about:blank") return
-        try { webView.clearHistory() } catch (_: Exception) {}
-        landingRootHistoryPending = false
+        // Kept as a no-op to preserve existing call sites. History is now tracked
+        // via landingBaselineIndex captured in showWebViewFromLanding().
     }
 
     private fun handleLandingBack(): Boolean {
         if (!landingEnabled || landingContainer?.visibility == View.VISIBLE) return false
-        if (landingRootHistoryPending) {
+        val index = try { webView.copyBackForwardList().currentIndex } catch (_: Exception) { 0 }
+        // The first linked page sits at landingBaselineIndex + 1. Anything beyond
+        // that means the user navigated deeper and should use normal back behavior.
+        if (index > landingBaselineIndex + 1 && webView.canGoBack()) {
+            webView.goBack()
+        } else {
             showLanding()
-            return true
         }
-        val historyIndex = try { webView.copyBackForwardList().currentIndex } catch (_: Exception) { 0 }
-        if (historyIndex > 0 && webView.canGoBack()) webView.goBack() else showLanding()
         return true
     }
 
