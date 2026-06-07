@@ -711,9 +711,25 @@ class MainActivity : AppCompatActivity() {
                 addView(originalUrl, "com.twitter.android")
             }
             lower.contains("facebook.com/sharer") || lower.contains("facebook.com/dialog/share") || lower.startsWith("fb:") -> {
+                // Facebook's app no longer accepts fb://facewebmodal or the https sharer URL
+                // routed into com.facebook.katana — both open to a blank screen. The reliable
+                // path is ACTION_SEND to the FB app (some versions accept it), then fall back
+                // to opening sharer.php in an EXTERNAL browser (not the FB app), where
+                // Facebook's web share dialog renders correctly.
                 val shareUrl = uri?.getQueryParameter("u") ?: uri?.getQueryParameter("href") ?: originalUrl
-                addView("fb://facewebmodal/f?href=${Uri.encode(shareUrl)}", "com.facebook.katana")
-                addView(originalUrl, "com.facebook.katana")
+                val sharerHttps = if (lower.startsWith("http")) originalUrl
+                    else "https://www.facebook.com/sharer/sharer.php?u=${Uri.encode(shareUrl)}"
+                candidates.add(Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, shareUrl)
+                    setPackage("com.facebook.katana")
+                })
+                // Force the sharer URL into a real browser, bypassing this WebView and the FB app.
+                val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(sharerHttps)).apply {
+                    addCategory(Intent.CATEGORY_BROWSABLE)
+                    // Exclude the FB app explicitly so it can't grab the intent again.
+                }
+                candidates.add(browserIntent)
             }
             lower.contains("messenger.com") || lower.contains("m.me/") || lower.startsWith("fb-messenger:") -> {
                 addView(originalUrl, "com.facebook.orca")
