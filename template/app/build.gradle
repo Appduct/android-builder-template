@@ -11,14 +11,14 @@ if (keystorePropertiesFile.exists()) {
 
 android {
     namespace '%%PACKAGE_NAME%%'
-    compileSdk 34
+    compileSdk 35
 
     defaultConfig {
         applicationId "%%PACKAGE_NAME%%"
         minSdk 24
-        targetSdk 34
-        versionCode 1
-        versionName "1.0.0"
+        targetSdk 35
+        versionCode %%VERSION_CODE%%
+        versionName "%%VERSION_NAME%%"
         // Strip unused locales from packaged resources to reduce APK size
         resConfigs "en"
         vectorDrawables.useSupportLibrary = true
