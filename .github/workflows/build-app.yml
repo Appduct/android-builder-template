@@ -87,6 +87,10 @@ on:
         description: 'JSON blob: {project_id, supabase_url, supabase_anon_key}'
         required: false
         default: '{}'
+      signing_config_json:
+        description: 'JSON blob: {keystore_b64, key_alias, store_password, key_password} - per-project signing key. Falls back to repo secrets if empty.'
+        required: false
+        default: '{}'
 
 
 jobs:
@@ -328,21 +332,52 @@ jobs:
 
 
       - name: Setup signing
+        env:
+          SIGNING_CONFIG_JSON: ${{ inputs.signing_config_json }}
+          SHARED_KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          SHARED_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          SHARED_STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          SHARED_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > build-output/release.keystore
+          set -e
+          sudo apt-get install -y jq > /dev/null 2>&1 || true
+          SC="${SIGNING_CONFIG_JSON:-}"
+          KEYSTORE_B64=""
+          KEY_ALIAS_VAL=""
+          STORE_PASS=""
+          KEY_PASS=""
+          if [ -n "$SC" ] && [ "$SC" != "{}" ]; then
+            KEYSTORE_B64=$(echo "$SC" | jq -r '.keystore_b64 // ""')
+            KEY_ALIAS_VAL=$(echo "$SC" | jq -r '.key_alias // ""')
+            STORE_PASS=$(echo "$SC" | jq -r '.store_password // ""')
+            KEY_PASS=$(echo "$SC" | jq -r '.key_password // ""')
+          fi
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "Using shared keystore (per-project keystore not provided)"
+            KEYSTORE_B64="$SHARED_KEYSTORE_B64"
+            KEY_ALIAS_VAL="$SHARED_KEY_ALIAS"
+            STORE_PASS="$SHARED_STORE_PASS"
+            KEY_PASS="$SHARED_KEY_PASS"
+          else
+            echo "Using per-project keystore"
+          fi
+
+          printf '%s' "$KEYSTORE_B64" | base64 -d > build-output/release.keystore
 
           keytool -list -v \
             -keystore build-output/release.keystore \
-            -alias "${{ secrets.KEY_ALIAS }}" \
-            -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
-            | grep -E "SHA1|SHA256"
-          
-          cat >> build-output/local.properties << EOF
+            -alias "$KEY_ALIAS_VAL" \
+            -storepass "$STORE_PASS" \
+            2>/dev/null | grep -E "SHA1|SHA256" || echo "(fingerprint listing skipped)"
+
+          cat >> build-output/local.properties << PROPS_EOF
           storeFile=../release.keystore
-          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
-          keyAlias=${{ secrets.KEY_ALIAS }}
-          keyPassword=${{ secrets.KEY_PASSWORD }}
-          EOF
+          storePassword=$STORE_PASS
+          keyAlias=$KEY_ALIAS_VAL
+          keyPassword=$KEY_PASS
+          PROPS_EOF
+
+
 
       - name: Make gradlew executable
         run: chmod +x build-output/gradlew
