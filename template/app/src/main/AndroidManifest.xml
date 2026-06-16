@@ -9,9 +9,8 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    %%KEEP_ALIVE_PERMISSIONS%%
     <!-- Media permissions intentionally omitted: the WebView file chooser uses the
          Storage Access Framework (ACTION_GET_CONTENT / OpenDocument), which does not
          require READ_MEDIA_* or READ_EXTERNAL_STORAGE. Declaring them caused Android 14's
@@ -89,11 +88,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <service
-            android:name=".KeepAliveService"
-            android:enabled="true"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
+        %%KEEP_ALIVE_SERVICE%%
     </application>
 </manifest>
