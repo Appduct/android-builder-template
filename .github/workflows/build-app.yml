@@ -93,6 +93,8 @@ on:
         default: '{}'
 
 
+
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -187,6 +189,9 @@ jobs:
           PROJECT_ID="$(jq_get "$SC" '.project_id')"
           SUPABASE_URL_VAL="$(jq_get "$SC" '.supabase_url')"
           SUPABASE_ANON_KEY_VAL="$(jq_get "$SC" '.supabase_anon_key')"
+          VERSION_CODE_VAL="$(jq_get "$EF" '.version_code')"; [ -z "$VERSION_CODE_VAL" ] && VERSION_CODE_VAL="1"
+          VERSION_NAME_VAL="$(jq_get "$EF" '.version_name')"; [ -z "$VERSION_NAME_VAL" ] && VERSION_NAME_VAL="1.0.0"
+
 
           
           # Copy template
@@ -217,6 +222,8 @@ jobs:
             sed -i "s|%%PROJECT_ID%%|${PROJECT_ID}|g" "$file"
             sed -i "s|%%SUPABASE_URL%%|${SUPABASE_URL_VAL}|g" "$file"
             sed -i "s|%%SUPABASE_ANON_KEY%%|${SUPABASE_ANON_KEY_VAL}|g" "$file"
+            sed -i "s|%%VERSION_CODE%%|${VERSION_CODE_VAL}|g" "$file"
+            sed -i "s|%%VERSION_NAME%%|${VERSION_NAME_VAL}|g" "$file"
           done
           
           # Move source files to correct package directory
@@ -334,41 +341,33 @@ jobs:
       - name: Setup signing
         env:
           SIGNING_CONFIG_JSON: ${{ inputs.signing_config_json }}
-          SHARED_KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
-          SHARED_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          SHARED_STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
-          SHARED_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -e
           sudo apt-get install -y jq > /dev/null 2>&1 || true
           SC="${SIGNING_CONFIG_JSON:-}"
-          KEYSTORE_B64=""
-          KEY_ALIAS_VAL=""
-          STORE_PASS=""
-          KEY_PASS=""
-          if [ -n "$SC" ] && [ "$SC" != "{}" ]; then
-            KEYSTORE_B64=$(echo "$SC" | jq -r '.keystore_b64 // ""')
-            KEY_ALIAS_VAL=$(echo "$SC" | jq -r '.key_alias // ""')
-            STORE_PASS=$(echo "$SC" | jq -r '.store_password // ""')
-            KEY_PASS=$(echo "$SC" | jq -r '.key_password // ""')
+          if [ -z "$SC" ] || [ "$SC" = "{}" ]; then
+            echo "::error::Per-project signing config was not provided. Refusing to fall back to the shared keystore — every app must be signed with its own unique key. Open the project's Signing Key tab and click 'Generate keystore now', then retry the build."
+            exit 1
           fi
-          if [ -z "$KEYSTORE_B64" ]; then
-            echo "Using shared keystore (per-project keystore not provided)"
-            KEYSTORE_B64="$SHARED_KEYSTORE_B64"
-            KEY_ALIAS_VAL="$SHARED_KEY_ALIAS"
-            STORE_PASS="$SHARED_STORE_PASS"
-            KEY_PASS="$SHARED_KEY_PASS"
-          else
-            echo "Using per-project keystore"
+          KEYSTORE_B64=$(echo "$SC" | jq -r '.keystore_b64 // ""')
+          KEY_ALIAS_VAL=$(echo "$SC" | jq -r '.key_alias // ""')
+          STORE_PASS=$(echo "$SC" | jq -r '.store_password // ""')
+          KEY_PASS=$(echo "$SC" | jq -r '.key_password // ""')
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$KEY_ALIAS_VAL" ] || [ -z "$STORE_PASS" ] || [ -z "$KEY_PASS" ]; then
+            echo "::error::Per-project signing config is incomplete (missing keystore_b64, key_alias, store_password, or key_password)."
+            exit 1
           fi
+          echo "Using per-project keystore (alias=$KEY_ALIAS_VAL)"
 
           printf '%s' "$KEYSTORE_B64" | base64 -d > build-output/release.keystore
 
+          echo "=== Per-project signing certificate fingerprints ==="
           keytool -list -v \
             -keystore build-output/release.keystore \
             -alias "$KEY_ALIAS_VAL" \
             -storepass "$STORE_PASS" \
-            2>/dev/null | grep -E "SHA1|SHA256" || echo "(fingerprint listing skipped)"
+            2>/dev/null | grep -E "SHA1|SHA256|Owner|Valid" || echo "(fingerprint listing skipped)"
+          echo "===================================================="
 
           cat >> build-output/local.properties << PROPS_EOF
           storeFile=../release.keystore
