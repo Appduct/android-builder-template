@@ -191,6 +191,22 @@ jobs:
           SUPABASE_ANON_KEY_VAL="$(jq_get "$SC" '.supabase_anon_key')"
           VERSION_CODE_VAL="$(jq_get "$EF" '.version_code')"; [ -z "$VERSION_CODE_VAL" ] && VERSION_CODE_VAL="1"
           VERSION_NAME_VAL="$(jq_get "$EF" '.version_name')"; [ -z "$VERSION_NAME_VAL" ] && VERSION_NAME_VAL="1.0.0"
+          KEEP_ALIVE_ENABLED="$(jq_get "$EF" '.keep_alive_enabled')"; [ -z "$KEEP_ALIVE_ENABLED" ] && KEEP_ALIVE_ENABLED="false"
+
+          # Conditional FOREGROUND_SERVICE wiring. Off by default to keep apps Play-policy compliant
+          # (FOREGROUND_SERVICE_DATA_SYNC requires user-visible sync work). Apps that opt in
+          # accept that they must justify the foreground service to Google Play.
+          if [ "$KEEP_ALIVE_ENABLED" = "true" ]; then
+            KEEP_ALIVE_PERMISSIONS='<uses-permission android:name="android.permission.FOREGROUND_SERVICE" /><uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />'
+            KEEP_ALIVE_SERVICE='<service android:name=".KeepAliveService" android:enabled="true" android:exported="false" android:foregroundServiceType="dataSync" />'
+            KEEP_ALIVE_START='try { val svc = Intent(this, KeepAliveService::class.java); if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) { startForegroundService(svc) } else { startService(svc) } } catch (_: Exception) {}'
+            KEEP_ALIVE_STOP='try { stopService(Intent(this, KeepAliveService::class.java)) } catch (_: Exception) {}'
+          else
+            KEEP_ALIVE_PERMISSIONS=''
+            KEEP_ALIVE_SERVICE=''
+            KEEP_ALIVE_START=''
+            KEEP_ALIVE_STOP=''
+          fi
 
 
           
@@ -224,6 +240,8 @@ jobs:
             sed -i "s|%%SUPABASE_ANON_KEY%%|${SUPABASE_ANON_KEY_VAL}|g" "$file"
             sed -i "s|%%VERSION_CODE%%|${VERSION_CODE_VAL}|g" "$file"
             sed -i "s|%%VERSION_NAME%%|${VERSION_NAME_VAL}|g" "$file"
+            # Use python for safer replacement of the keep-alive blocks (avoid sed delimiter issues with quotes/angles)
+            KEEP_ALIVE_PERMISSIONS="$KEEP_ALIVE_PERMISSIONS" KEEP_ALIVE_SERVICE="$KEEP_ALIVE_SERVICE" KEEP_ALIVE_START="$KEEP_ALIVE_START" KEEP_ALIVE_STOP="$KEEP_ALIVE_STOP" python3 -c "import sys,os; p=sys.argv[1]; s=open(p,encoding='utf-8',errors='ignore').read(); s=s.replace('%%KEEP_ALIVE_PERMISSIONS%%', os.environ.get('KEEP_ALIVE_PERMISSIONS','')); s=s.replace('%%KEEP_ALIVE_SERVICE%%', os.environ.get('KEEP_ALIVE_SERVICE','')); s=s.replace('%%KEEP_ALIVE_START%%', os.environ.get('KEEP_ALIVE_START','')); s=s.replace('%%KEEP_ALIVE_STOP%%', os.environ.get('KEEP_ALIVE_STOP','')); open(p,'w',encoding='utf-8').write(s)" "$file"
           done
           
           # Move source files to correct package directory
