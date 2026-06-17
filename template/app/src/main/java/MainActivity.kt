@@ -584,13 +584,30 @@ class MainActivity : AppCompatActivity() {
             ): Boolean {
                 try {
                     val hitUrl = view?.hitTestResult?.extra
-                    if (!hitUrl.isNullOrBlank() && handleExternalUrl(hitUrl, forceExternal = true)) return false
+                    if (!hitUrl.isNullOrBlank()) {
+                        // If toggle is OFF, always push to the system browser/native app.
+                        // If toggle is ON, only leave the app for share/non-http URLs;
+                        // plain http(s) links load in the main WebView.
+                        if (!externalLinksInApp) {
+                            handleExternalUrl(hitUrl, forceExternal = true)
+                            return false
+                        }
+                        if (handleExternalUrl(hitUrl, forceExternal = false)) return false
+                        try { webView.loadUrl(hitUrl) } catch (_: Exception) {}
+                        return false
+                    }
                 } catch (_: Exception) {}
+                // Fallback for window.open() with no hitTestResult — wait for first
+                // navigation in a throwaway WebView, then route per toggle.
                 val tempWebView = WebView(this@MainActivity)
                 tempWebView.webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(v: WebView?, request: WebResourceRequest?): Boolean {
                         val url = request?.url?.toString() ?: return true
-                        handleExternalUrl(url, forceExternal = true)
+                        if (!externalLinksInApp) {
+                            handleExternalUrl(url, forceExternal = true)
+                        } else if (!handleExternalUrl(url, forceExternal = false)) {
+                            try { webView.loadUrl(url) } catch (_: Exception) {}
+                        }
                         return true
                     }
                 }
