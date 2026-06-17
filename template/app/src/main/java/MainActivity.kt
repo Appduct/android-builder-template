@@ -54,6 +54,9 @@ class MainActivity : AppCompatActivity() {
     private val landingEnabled: Boolean = %%LANDING_ENABLED%%
     private val landingLayoutPref: String = "%%LANDING_LAYOUT%%"
     private val navTabsEnabled: Boolean = %%NAV_TABS_ENABLED%%
+    // When false, any external-domain http(s) link is opened in the system browser
+    // instead of inside this WebView.
+    private val externalLinksInApp: Boolean = %%EXTERNAL_LINKS_IN_APP%%
 
 
     private val websiteUrl = "%%WEBSITE_URL%%"
@@ -253,16 +256,7 @@ class MainActivity : AppCompatActivity() {
         syncHandler.post(syncRunnable)
         startSyncRealtime()
 
-        // Start a lightweight foreground service so Android keeps the app process
-        // alive when backgrounded (so reopening is instant and ongoing audio/state survives).
-        try {
-            val svc = Intent(this, KeepAliveService::class.java)
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                startForegroundService(svc)
-            } else {
-                startService(svc)
-            }
-        } catch (_: Exception) {}
+        // %%KEEP_ALIVE_START%%
     }
 
     /**
@@ -633,7 +627,13 @@ class MainActivity : AppCompatActivity() {
         )
         val isShareUrl = shareHosts.any { lower.contains(it) }
 
-        if (nonHttp || isShareUrl || forceExternal) {
+        // Per-app preference: when external links should open in the system browser,
+        // any http(s) URL whose host differs from the wrapped website's host is sent out.
+        val isExternalHostHttp = !externalLinksInApp &&
+            (lower.startsWith("http://") || lower.startsWith("https://")) &&
+            isExternalHost(url)
+
+        if (nonHttp || isShareUrl || forceExternal || isExternalHostHttp) {
             try {
                 val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -646,6 +646,16 @@ class MainActivity : AppCompatActivity() {
             return true
         }
         return false
+    }
+
+    /** Returns true when [url]'s host is different from the wrapped website's host. */
+    private fun isExternalHost(url: String): Boolean {
+        return try {
+            val target = (Uri.parse(url).host ?: "").lowercase().removePrefix("www.")
+            val base = (Uri.parse(websiteUrl).host ?: "").lowercase().removePrefix("www.")
+            if (target.isEmpty() || base.isEmpty()) false
+            else target != base && !target.endsWith(".$base") && !base.endsWith(".$target")
+        } catch (_: Exception) { false }
     }
 
     private fun isBlockedExternalPage(url: String): Boolean {
@@ -1326,7 +1336,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         try { prewarmWebView?.destroy() } catch (_: Exception) {}
         prewarmWebView = null
-        try { stopService(Intent(this, KeepAliveService::class.java)) } catch (_: Exception) {}
+        // %%KEEP_ALIVE_STOP%%
         super.onDestroy()
     }
 
