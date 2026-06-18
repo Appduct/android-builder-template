@@ -361,10 +361,14 @@ jobs:
       - name: Setup signing
         env:
           SIGNING_CONFIG_JSON: ${{ inputs.signing_config_json }}
+          SYNC_CONFIG_JSON: ${{ inputs.sync_config_json }}
         run: |
           set -e
           sudo apt-get install -y jq > /dev/null 2>&1 || true
           SC="${SIGNING_CONFIG_JSON:-}"
+          if [ -z "$SC" ] || [ "$SC" = "{}" ]; then
+            SC=$(printf '%s' "${SYNC_CONFIG_JSON:-{}}" | jq -c '.signing_config // {}' 2>/dev/null || echo '{}')
+          fi
           if [ -z "$SC" ] || [ "$SC" = "{}" ]; then
             echo "::error::Per-project signing config was not provided. Refusing to fall back to the shared keystore — every app must be signed with its own unique key. Open the project's Signing Key tab and click 'Generate keystore now', then retry the build."
             exit 1
