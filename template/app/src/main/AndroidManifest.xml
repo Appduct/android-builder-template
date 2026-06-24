@@ -10,8 +10,9 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.USE_FINGERPRINT" />
     %%KEEP_ALIVE_PERMISSIONS%%
-    %%BIOMETRIC_PERMISSIONS%%
     <!-- Media permissions intentionally omitted: the WebView file chooser uses the
          Storage Access Framework (ACTION_GET_CONTENT / OpenDocument), which does not
          require READ_MEDIA_* or READ_EXTERNAL_STORAGE. Declaring them caused Android 14's
