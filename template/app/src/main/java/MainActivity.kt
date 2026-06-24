@@ -57,9 +57,9 @@ class MainActivity : AppCompatActivity() {
     // When false, any external-domain http(s) link is opened in the system browser
     // instead of inside this WebView.
     private val externalLinksInApp: Boolean = %%EXTERNAL_LINKS_IN_APP%%
-    // Require device biometric (fingerprint / face) before content loads.
+    // Require fingerprint / face / device credential before the app contents are shown.
     private val biometricEnabled: Boolean = %%BIOMETRIC_ENABLED%%
-    private var biometricPassed: Boolean = false
+    private var biometricAuthPassed: Boolean = false
 
 
     private val websiteUrl = "%%WEBSITE_URL%%"
@@ -235,32 +235,93 @@ class MainActivity : AppCompatActivity() {
         // Android 14+ causes the "Allow access to more photos and videos" partial-access
         // dialog to re-appear on every launch and screen flicker.
 
-        if (landingEnabled && setupLanding()) {
-            // Landing shown — skip auto-loading the website URL. Tile clicks load it.
-        } else {
-            splashView.visibility = View.VISIBLE
-            webView.visibility = View.INVISIBLE
+        // Show splash while we (optionally) wait for biometric authentication.
+        splashView.visibility = View.VISIBLE
+        if (!landingEnabled) webView.visibility = View.INVISIBLE
 
-            if (isNetworkAvailable()) {
-                loadUrl()
-            } else if (offlineModeEnabled) {
-                // Try cached version
-                webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
-                triedCacheFallback = true
-                loadUrl()
+        runBiometricGate {
+            if (landingEnabled && setupLanding()) {
+                // Landing shown — skip auto-loading the website URL. Tile clicks load it.
             } else {
-                dismissSplash()
-                showError("Please check your internet connection and try again.")
+                splashView.visibility = View.VISIBLE
+                webView.visibility = View.INVISIBLE
+
+                if (isNetworkAvailable()) {
+                    loadUrl()
+                } else if (offlineModeEnabled) {
+                    // Try cached version
+                    webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                    triedCacheFallback = true
+                    loadUrl()
+                } else {
+                    dismissSplash()
+                    showError("Please check your internet connection and try again.")
+                }
             }
+
+
+            syncHandler.removeCallbacks(syncRunnable)
+            syncHandler.post(syncRunnable)
+            startSyncRealtime()
+
+            // %%KEEP_ALIVE_START%%
         }
-
-
-        syncHandler.removeCallbacks(syncRunnable)
-        syncHandler.post(syncRunnable)
-        startSyncRealtime()
-
-        // %%KEEP_ALIVE_START%%
     }
+
+    /**
+     * Gates app startup behind a biometric (or device-credential) prompt when the
+     * project has Biometric Login enabled. If the device has no biometric/credential
+     * enrolled, or the feature is off, the gate is bypassed silently.
+     */
+    private fun runBiometricGate(onSuccess: () -> Unit) {
+        if (biometricAuthPassed || !biometricEnabled) { onSuccess(); return }
+        try {
+            val authenticators = androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK
+            val bm = androidx.biometric.BiometricManager.from(this)
+            val can = bm.canAuthenticate(authenticators)
+            if (can != androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS) {
+                // No fingerprint/face enrolled — fall through silently per spec.
+                biometricAuthPassed = true
+                onSuccess()
+                return
+            }
+            val executor = androidx.core.content.ContextCompat.getMainExecutor(this)
+            val appLabel = try { applicationInfo.loadLabel(packageManager).toString() } catch (_: Throwable) { "App" }
+            val prompt = androidx.biometric.BiometricPrompt(this, executor,
+                object : androidx.biometric.BiometricPrompt.AuthenticationCallback() {
+                    override fun onAuthenticationSucceeded(result: androidx.biometric.BiometricPrompt.AuthenticationResult) {
+                        biometricAuthPassed = true
+                        onSuccess()
+                    }
+                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        when (errorCode) {
+                            androidx.biometric.BiometricPrompt.ERROR_USER_CANCELED,
+                            androidx.biometric.BiometricPrompt.ERROR_NEGATIVE_BUTTON,
+                            androidx.biometric.BiometricPrompt.ERROR_CANCELED -> finish()
+                            androidx.biometric.BiometricPrompt.ERROR_LOCKOUT,
+                            androidx.biometric.BiometricPrompt.ERROR_LOCKOUT_PERMANENT -> finish()
+                            else -> {
+                                // Hardware/unknown error — don't lock the user out forever.
+                                biometricAuthPassed = true
+                                onSuccess()
+                            }
+                        }
+                    }
+                })
+            val info = androidx.biometric.BiometricPrompt.PromptInfo.Builder()
+                .setTitle("Unlock $appLabel")
+                .setSubtitle("Authenticate to continue")
+                .setAllowedAuthenticators(authenticators)
+                .setNegativeButtonText("Cancel")
+                .build()
+            prompt.authenticate(info)
+        } catch (_: Throwable) {
+            biometricAuthPassed = true
+            onSuccess()
+        }
+    }
+
+
 
     /**
      * Detects whether the user has something in flight that a reload would disrupt:
@@ -1070,58 +1131,12 @@ class MainActivity : AppCompatActivity() {
 
 
     private fun loadUrl() {
-        if (biometricEnabled && !biometricPassed) {
-            promptBiometric()
-            return
-        }
         val headers = hashMapOf(
             "Cache-Control" to "no-cache, no-store, must-revalidate",
             "Pragma" to "no-cache",
             "Expires" to "0"
         )
         webView.loadUrl(websiteUrl, headers)
-    }
-
-    private fun promptBiometric() {
-        try {
-            val biometricManager = androidx.biometric.BiometricManager.from(this)
-            val authenticators = androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK or
-                androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
-            val canAuth = biometricManager.canAuthenticate(authenticators)
-            if (canAuth != androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS) {
-                // No biometric/credential available on this device — fall through and load.
-                biometricPassed = true
-                loadUrl()
-                return
-            }
-            val executor = androidx.core.content.ContextCompat.getMainExecutor(this)
-            val callback = object : androidx.biometric.BiometricPrompt.AuthenticationCallback() {
-                override fun onAuthenticationSucceeded(result: androidx.biometric.BiometricPrompt.AuthenticationResult) {
-                    biometricPassed = true
-                    loadUrl()
-                }
-                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                    // User cancelled or unrecoverable error — close the app rather than show content.
-                    try { android.widget.Toast.makeText(this@MainActivity, "Authentication required", android.widget.Toast.LENGTH_SHORT).show() } catch (_: Exception) {}
-                    finishAndRemoveTask()
-                }
-                override fun onAuthenticationFailed() {
-                    // Wrong fingerprint/face — system prompt allows retry; do nothing.
-                }
-            }
-            val prompt = androidx.biometric.BiometricPrompt(this, executor, callback)
-            val appName = try { applicationInfo.loadLabel(packageManager).toString() } catch (_: Throwable) { "App" }
-            val info = androidx.biometric.BiometricPrompt.PromptInfo.Builder()
-                .setTitle("Unlock $appName")
-                .setSubtitle("Verify it's you to continue")
-                .setAllowedAuthenticators(authenticators)
-                .build()
-            prompt.authenticate(info)
-        } catch (_: Throwable) {
-            // If anything goes wrong with the biometric API, don't lock the user out.
-            biometricPassed = true
-            loadUrl()
-        }
     }
 
     private fun loadFreshWebsite() {
