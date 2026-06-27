@@ -61,6 +61,23 @@ class MainActivity : AppCompatActivity() {
     private val biometricEnabled: Boolean = %%BIOMETRIC_ENABLED%%
     private var biometricAuthPassed: Boolean = false
 
+    // AdMob — values templated at build time.
+    private val admobEnabled: Boolean = %%ADMOB_ENABLED%%
+    private val admobAppId: String = "%%ADMOB_APP_ID%%"
+    private val admobBannerId: String = "%%ADMOB_BANNER_ID%%"
+    private val admobInterstitialId: String = "%%ADMOB_INTERSTITIAL_ID%%"
+    private val admobAppOpenEnabled: Boolean = %%ADMOB_APP_OPEN_ENABLED%%
+    private val admobAppOpenId: String = "%%ADMOB_APP_OPEN_ID%%"
+    private val admobInterstitialInterval: Int = %%ADMOB_INTERSTITIAL_INTERVAL%%
+    private var bannerAdView: com.google.android.gms.ads.AdView? = null
+    private var interstitialAd: com.google.android.gms.ads.interstitial.InterstitialAd? = null
+    private var appOpenAd: com.google.android.gms.ads.appopen.AppOpenAd? = null
+    private var pageLoadCounter: Int = 0
+    private var isShowingAppOpenAd: Boolean = false
+    private var appOpenAdShownThisSession: Boolean = false
+    private var mobileAdsInitialized: Boolean = false
+
+
 
     private val websiteUrl = "%%WEBSITE_URL%%"
     private val expiryTimestamp: Long = %%EXPIRY_TIMESTAMP%%L
@@ -210,6 +227,10 @@ class MainActivity : AppCompatActivity() {
         landingView = findViewById(R.id.landingView)
         landingContainer = findViewById(R.id.landingContainer)
         landingIntroView = findViewById(R.id.landingIntro)
+
+        // Initialize AdMob once the activity has its content view.
+        initAdMobIfEnabled()
+
 
         val retryButton = findViewById<View>(R.id.retryButton)
         retryButton.setOnClickListener {
@@ -434,7 +455,12 @@ class MainActivity : AppCompatActivity() {
                     prewarmDone = true
                     Handler(Looper.getMainLooper()).postDelayed({ prewarmOfflineCache() }, 1500)
                 }
+                // AdMob: count this page load and possibly show an interstitial.
+                if (!url.isNullOrBlank() && url != "about:blank") {
+                    maybeShowInterstitial()
+                }
             }
+
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 if (request?.isForMainFrame == true) {
@@ -1224,6 +1250,11 @@ class MainActivity : AppCompatActivity() {
         syncHandler.removeCallbacks(syncRunnable)
         syncHandler.post(syncRunnable)
         startSyncRealtime()
+
+        // AdMob: show App Open ad when returning from background (skip first launch).
+        if (lastPauseTime > 0L && !isPickingFile) {
+            showAppOpenAdIfAvailable()
+        }
     }
 
     override fun onPause() {
@@ -1592,4 +1623,132 @@ class MainActivity : AppCompatActivity() {
         } else if (webView.canGoBack()) { webView.goBack() }
         else { @Suppress("DEPRECATION") super.onBackPressed() }
     }
+
+    // ===================== AdMob =====================
+
+    private fun initAdMobIfEnabled() {
+        if (!admobEnabled) return
+        try {
+            com.google.android.gms.ads.MobileAds.initialize(this) {
+                mobileAdsInitialized = true
+                loadBannerAd()
+                loadInterstitialAd()
+                loadAppOpenAd()
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w("AdMob", "MobileAds.initialize failed: ${t.message}")
+        }
+    }
+
+    private fun isRealAdUnit(id: String): Boolean {
+        val v = id.trim()
+        return v.isNotEmpty() && v != "none" && !v.startsWith("%%")
+    }
+
+    private fun loadBannerAd() {
+        if (!isRealAdUnit(admobBannerId)) return
+        try {
+            val container = findViewById<FrameLayout>(R.id.adContainer) ?: return
+            // Remove any previous instance.
+            try { bannerAdView?.let { container.removeView(it); it.destroy() } } catch (_: Throwable) {}
+            val ad = com.google.android.gms.ads.AdView(this).apply {
+                adUnitId = admobBannerId
+                setAdSize(com.google.android.gms.ads.AdSize.BANNER)
+            }
+            container.removeAllViews()
+            container.addView(ad)
+            bannerAdView = ad
+            ad.loadAd(com.google.android.gms.ads.AdRequest.Builder().build())
+        } catch (t: Throwable) {
+            android.util.Log.w("AdMob", "Banner load failed: ${t.message}")
+        }
+    }
+
+    private fun loadInterstitialAd() {
+        if (!isRealAdUnit(admobInterstitialId)) return
+        try {
+            com.google.android.gms.ads.interstitial.InterstitialAd.load(
+                this,
+                admobInterstitialId,
+                com.google.android.gms.ads.AdRequest.Builder().build(),
+                object : com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback() {
+                    override fun onAdLoaded(ad: com.google.android.gms.ads.interstitial.InterstitialAd) {
+                        interstitialAd = ad
+                        ad.fullScreenContentCallback = object : com.google.android.gms.ads.FullScreenContentCallback() {
+                            override fun onAdDismissedFullScreenContent() {
+                                interstitialAd = null
+                                loadInterstitialAd()
+                            }
+                            override fun onAdFailedToShowFullScreenContent(error: com.google.android.gms.ads.AdError) {
+                                interstitialAd = null
+                                loadInterstitialAd()
+                            }
+                        }
+                    }
+                    override fun onAdFailedToLoad(error: com.google.android.gms.ads.LoadAdError) {
+                        interstitialAd = null
+                    }
+                }
+            )
+        } catch (t: Throwable) {
+            android.util.Log.w("AdMob", "Interstitial load failed: ${t.message}")
+        }
+    }
+
+    private fun maybeShowInterstitial() {
+        if (!isRealAdUnit(admobInterstitialId)) return
+        val interval = if (admobInterstitialInterval > 0) admobInterstitialInterval else 3
+        pageLoadCounter += 1
+        if (pageLoadCounter % interval != 0) return
+        val ad = interstitialAd ?: run { loadInterstitialAd(); return }
+        try { ad.show(this) } catch (t: Throwable) {
+            android.util.Log.w("AdMob", "Interstitial show failed: ${t.message}")
+        }
+    }
+
+    private fun loadAppOpenAd() {
+        if (!admobAppOpenEnabled || !isRealAdUnit(admobAppOpenId)) return
+        try {
+            com.google.android.gms.ads.appopen.AppOpenAd.load(
+                this,
+                admobAppOpenId,
+                com.google.android.gms.ads.AdRequest.Builder().build(),
+                object : com.google.android.gms.ads.appopen.AppOpenAd.AppOpenAdLoadCallback() {
+                    override fun onAdLoaded(ad: com.google.android.gms.ads.appopen.AppOpenAd) {
+                        appOpenAd = ad
+                    }
+                    override fun onAdFailedToLoad(error: com.google.android.gms.ads.LoadAdError) {
+                        appOpenAd = null
+                    }
+                }
+            )
+        } catch (t: Throwable) {
+            android.util.Log.w("AdMob", "AppOpen load failed: ${t.message}")
+        }
+    }
+
+    private fun showAppOpenAdIfAvailable() {
+        if (!admobAppOpenEnabled || !isRealAdUnit(admobAppOpenId)) return
+        if (isShowingAppOpenAd) return
+        val ad = appOpenAd ?: run { loadAppOpenAd(); return }
+        ad.fullScreenContentCallback = object : com.google.android.gms.ads.FullScreenContentCallback() {
+            override fun onAdDismissedFullScreenContent() {
+                appOpenAd = null
+                isShowingAppOpenAd = false
+                loadAppOpenAd()
+            }
+            override fun onAdFailedToShowFullScreenContent(error: com.google.android.gms.ads.AdError) {
+                appOpenAd = null
+                isShowingAppOpenAd = false
+                loadAppOpenAd()
+            }
+            override fun onAdShowedFullScreenContent() {
+                isShowingAppOpenAd = true
+            }
+        }
+        try { ad.show(this) } catch (t: Throwable) {
+            android.util.Log.w("AdMob", "AppOpen show failed: ${t.message}")
+        }
+    }
 }
+
