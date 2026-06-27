@@ -98,6 +98,12 @@ class MainActivity : AppCompatActivity() {
     private var pendingGeoOrigin: String? = null
     private var pendingGeoCallback: GeolocationPermissions.Callback? = null
 
+    // Pending WebView camera/mic permission request (held while we ask the OS for runtime perms).
+    // Needed so in-page QR scanners / video chat / getUserMedia work — WebView's PermissionRequest
+    // only grants the per-origin webview-level permission; the underlying capture still requires
+    // Manifest.permission.CAMERA / RECORD_AUDIO at runtime on Android 6+.
+    private var pendingMediaRequest: PermissionRequest? = null
+
     // Offline pre-warm cache state
     private var prewarmDone = false
     private var prewarmWebView: WebView? = null
@@ -432,6 +438,49 @@ class MainActivity : AppCompatActivity() {
         // Expose a native share bridge so navigator.share() opens the OS share sheet
         try { webView.addJavascriptInterface(NativeShareBridge(), "AndroidShareBridge") } catch (_: Exception) {}
 
+        // Enable file downloads triggered from the wrapped site (links with download attr,
+        // Content-Disposition: attachment, generated PDFs, images, etc). For http(s) URLs we
+        // hand off to Android's DownloadManager which shows a notification and saves to the
+        // public Downloads folder; for data: URIs we decode and write the bytes directly so
+        // sites that build files in JS still work. After completion we offer to open the file.
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+            try {
+                val resolvedName = try {
+                    URLUtil.guessFileName(url, contentDisposition, mimeType)
+                } catch (_: Exception) { "download" }
+                if (url.startsWith("data:", ignoreCase = true)) {
+                    saveDataUriToDownloads(url, resolvedName, mimeType)
+                    return@setDownloadListener
+                }
+                val request = android.app.DownloadManager.Request(Uri.parse(url)).apply {
+                    setMimeType(mimeType)
+                    addRequestHeader("User-Agent", userAgent ?: webView.settings.userAgentString)
+                    addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
+                    setTitle(resolvedName)
+                    setDescription("Downloading $resolvedName")
+                    setNotificationVisibility(
+                        android.app.DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
+                    )
+                    setDestinationInExternalPublicDir(
+                        android.os.Environment.DIRECTORY_DOWNLOADS, resolvedName
+                    )
+                    allowScanningByMediaScanner()
+                }
+                val dm = getSystemService(DOWNLOAD_SERVICE) as android.app.DownloadManager
+                dm.enqueue(request)
+                android.widget.Toast.makeText(
+                    this, "Downloading $resolvedName", android.widget.Toast.LENGTH_SHORT
+                ).show()
+            } catch (e: Exception) {
+                try {
+                    android.widget.Toast.makeText(
+                        this, "Download failed: ${e.message ?: e.javaClass.simpleName}",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                } catch (_: Exception) {}
+            }
+        }
+
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
@@ -590,9 +639,38 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onPermissionRequest(request: PermissionRequest?) {
-                // Grant camera/microphone access when the wrapped website requests it (getUserMedia)
+                // Grant camera/microphone access when the wrapped website requests it (getUserMedia,
+                // QR scanners, video chat). We first ensure the underlying OS-level CAMERA /
+                // RECORD_AUDIO permissions are granted, otherwise PermissionRequest.grant() succeeds
+                // but capture still fails with NotAllowedError.
+                if (request == null) return
                 runOnUiThread {
-                    try { request?.grant(request.resources) } catch (_: Exception) { request?.deny() }
+                    try {
+                        val resources = request.resources
+                        val needed = mutableListOf<String>()
+                        if (resources.any { it == PermissionRequest.RESOURCE_VIDEO_CAPTURE }) {
+                            if (androidx.core.content.ContextCompat.checkSelfPermission(
+                                    this@MainActivity, android.Manifest.permission.CAMERA
+                                ) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                needed.add(android.Manifest.permission.CAMERA)
+                            }
+                        }
+                        if (resources.any { it == PermissionRequest.RESOURCE_AUDIO_CAPTURE }) {
+                            if (androidx.core.content.ContextCompat.checkSelfPermission(
+                                    this@MainActivity, android.Manifest.permission.RECORD_AUDIO
+                                ) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                needed.add(android.Manifest.permission.RECORD_AUDIO)
+                            }
+                        }
+                        if (needed.isEmpty()) {
+                            request.grant(resources)
+                        } else {
+                            pendingMediaRequest = request
+                            androidx.core.app.ActivityCompat.requestPermissions(
+                                this@MainActivity, needed.toTypedArray(), 2003
+                            )
+                        }
+                    } catch (_: Exception) { try { request.deny() } catch (_: Exception) {} }
                 }
             }
 
@@ -1586,6 +1664,67 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {}
             pendingGeoOrigin = null
             pendingGeoCallback = null
+        }
+        if (requestCode == 2003) {
+            val req = pendingMediaRequest
+            pendingMediaRequest = null
+            try {
+                if (req != null) {
+                    val allGranted = grantResults.isNotEmpty() &&
+                        grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+                    if (allGranted) req.grant(req.resources) else req.deny()
+                }
+            } catch (_: Exception) { try { req?.deny() } catch (_: Exception) {} }
+        }
+    }
+
+    /** Decode a data: URI download and save it to the public Downloads folder. */
+    private fun saveDataUriToDownloads(dataUri: String, fileName: String, mimeType: String?) {
+        try {
+            val comma = dataUri.indexOf(',')
+            if (comma < 0) return
+            val header = dataUri.substring(5, comma)
+            val payload = dataUri.substring(comma + 1)
+            val bytes = if (header.contains("base64")) {
+                android.util.Base64.decode(payload, android.util.Base64.DEFAULT)
+            } else {
+                java.net.URLDecoder.decode(payload, "UTF-8").toByteArray()
+            }
+            val resolver = contentResolver
+            val savedUri: Uri? = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    if (!mimeType.isNullOrBlank()) put(android.provider.MediaStore.Downloads.MIME_TYPE, mimeType)
+                    put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    resolver.openOutputStream(uri)?.use { it.write(bytes) }
+                    values.clear()
+                    values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                }
+                uri
+            } else {
+                val dir = android.os.Environment.getExternalStoragePublicDirectory(
+                    android.os.Environment.DIRECTORY_DOWNLOADS
+                )
+                if (!dir.exists()) dir.mkdirs()
+                val file = java.io.File(dir, fileName)
+                file.outputStream().use { it.write(bytes) }
+                Uri.fromFile(file)
+            }
+            android.widget.Toast.makeText(
+                this, "Saved $fileName to Downloads", android.widget.Toast.LENGTH_SHORT
+            ).show()
+            savedUri?.let { /* available for future open-after-download hook */ }
+        } catch (e: Exception) {
+            try {
+                android.widget.Toast.makeText(
+                    this, "Save failed: ${e.message ?: e.javaClass.simpleName}",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            } catch (_: Exception) {}
         }
     }
 
