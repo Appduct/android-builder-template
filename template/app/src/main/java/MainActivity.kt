@@ -452,6 +452,24 @@ class MainActivity : AppCompatActivity() {
                     saveDataUriToDownloads(url, resolvedName, mimeType)
                     return@setDownloadListener
                 }
+                if (url.startsWith("blob:", ignoreCase = true)) {
+                    // WebView cannot download blob: URLs directly — they only exist inside the
+                    // page's JS context. Inject a fetcher that reads the blob with FileReader
+                    // and hands the bytes back to Kotlin via AndroidShareBridge.saveBase64.
+                    val safeName = org.json.JSONObject.quote(resolvedName)
+                    val safeMime = org.json.JSONObject.quote(mimeType ?: "application/octet-stream")
+                    val safeUrl = org.json.JSONObject.quote(url)
+                    val js = "(function(){try{var x=new XMLHttpRequest();x.open('GET',$safeUrl,true);x.responseType='blob';" +
+                        "x.onload=function(){try{var b=x.response;var r=new FileReader();" +
+                        "r.onloadend=function(){try{var s=String(r.result||'');var i=s.indexOf(',');var d=i>=0?s.substring(i+1):'';" +
+                        "AndroidShareBridge.saveBase64(d,$safeName,$safeMime);}catch(e){AndroidShareBridge.toast('Save failed: '+e);}};" +
+                        "r.onerror=function(){AndroidShareBridge.toast('Read failed');};r.readAsDataURL(b);" +
+                        "}catch(e){AndroidShareBridge.toast('Blob error: '+e);}};" +
+                        "x.onerror=function(){AndroidShareBridge.toast('Download failed');};x.send();" +
+                        "}catch(e){AndroidShareBridge.toast('Blob fetch error: '+e);}})();"
+                    webView.evaluateJavascript(js, null)
+                    return@setDownloadListener
+                }
                 val request = android.app.DownloadManager.Request(Uri.parse(url)).apply {
                     setMimeType(mimeType)
                     addRequestHeader("User-Agent", userAgent ?: webView.settings.userAgentString)
@@ -1564,7 +1582,130 @@ class MainActivity : AppCompatActivity() {
                 try { handleExternalUrl(url, forceExternal = true) } catch (_: Exception) {}
             }
         }
+
+        /** Show a short toast (used by injected JS to surface errors back to the user). */
+        @android.webkit.JavascriptInterface
+        fun toast(msg: String?) {
+            runOnUiThread {
+                try {
+                    android.widget.Toast.makeText(
+                        this@MainActivity, msg ?: "", android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                } catch (_: Exception) {}
+            }
+        }
+
+        /**
+         * Save a base64-encoded blob (e.g. from a blob: download or a generated PDF) into
+         * the public Downloads folder. Called from the JS shim when WebView cannot handle
+         * the download natively.
+         */
+        @android.webkit.JavascriptInterface
+        fun saveBase64(base64: String?, fileName: String?, mimeType: String?) {
+            if (base64.isNullOrBlank()) return
+            runOnUiThread {
+                try {
+                    val name = fileName?.takeIf { it.isNotBlank() } ?: "download"
+                    val mt = mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+                    val bytes = android.util.Base64.decode(base64, android.util.Base64.DEFAULT)
+                    saveBytesToDownloads(bytes, name, mt)
+                } catch (e: Exception) {
+                    try {
+                        android.widget.Toast.makeText(
+                            this@MainActivity, "Save failed: ${e.message ?: e.javaClass.simpleName}",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+
+        /**
+         * Share a single base64-encoded file via the Android system share sheet. The bytes
+         * are written to the app's cache and exposed through a FileProvider so target apps
+         * (WhatsApp, Gmail, Drive, ...) can read them.
+         */
+        @android.webkit.JavascriptInterface
+        fun shareBase64(base64: String?, fileName: String?, mimeType: String?, title: String?, text: String?) {
+            if (base64.isNullOrBlank()) return
+            runOnUiThread {
+                try {
+                    val name = fileName?.takeIf { it.isNotBlank() } ?: "shared"
+                    val mt = mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+                    val bytes = android.util.Base64.decode(base64, android.util.Base64.DEFAULT)
+                    val uri = writeToShareCache(bytes, name) ?: return@runOnUiThread
+                    val send = Intent(Intent.ACTION_SEND).apply {
+                        type = mt
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        if (!title.isNullOrBlank()) putExtra(Intent.EXTRA_SUBJECT, title)
+                        if (!text.isNullOrBlank()) putExtra(Intent.EXTRA_TEXT, text)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    val chooser = Intent.createChooser(send, title?.ifBlank { "Share" } ?: "Share")
+                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(chooser)
+                } catch (e: Exception) {
+                    try {
+                        android.widget.Toast.makeText(
+                            this@MainActivity, "Share failed: ${e.message ?: e.javaClass.simpleName}",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    } catch (_: Exception) {}
+                }
+            }
+        }
     }
+
+    /** Write bytes into cache/shared and return a content:// uri via FileProvider. */
+    private fun writeToShareCache(bytes: ByteArray, fileName: String): Uri? {
+        return try {
+            val dir = java.io.File(cacheDir, "shared")
+            if (!dir.exists()) dir.mkdirs()
+            val safe = fileName.replace("[^A-Za-z0-9._-]".toRegex(), "_").ifEmpty { "shared" }
+            val file = java.io.File(dir, safe)
+            file.outputStream().use { it.write(bytes) }
+            androidx.core.content.FileProvider.getUriForFile(
+                this, "${packageName}.fileprovider", file
+            )
+        } catch (_: Exception) { null }
+    }
+
+    /** Save raw bytes into the public Downloads folder using MediaStore on Q+. */
+    private fun saveBytesToDownloads(bytes: ByteArray, fileName: String, mimeType: String) {
+        val resolver = contentResolver
+        val savedUri: Uri? = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, fileName)
+                put(android.provider.MediaStore.Downloads.MIME_TYPE, mimeType)
+                put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            if (uri != null) {
+                resolver.openOutputStream(uri)?.use { it.write(bytes) }
+                values.clear()
+                values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+            }
+            uri
+        } else {
+            val dir = android.os.Environment.getExternalStoragePublicDirectory(
+                android.os.Environment.DIRECTORY_DOWNLOADS
+            )
+            if (!dir.exists()) dir.mkdirs()
+            val file = java.io.File(dir, fileName)
+            file.outputStream().use { it.write(bytes) }
+            Uri.fromFile(file)
+        }
+        try {
+            android.widget.Toast.makeText(
+                this, "Saved $fileName to Downloads", android.widget.Toast.LENGTH_SHORT
+            ).show()
+        } catch (_: Exception) {}
+        savedUri?.let { /* future open-after-download hook */ }
+    }
+
+
 
     /**
      * Override navigator.share / canShare AND intercept share-link clicks + window.open,
@@ -1576,7 +1717,8 @@ class MainActivity : AppCompatActivity() {
         val js = "(function(){try{" +
             "if(window.__appductShareShim)return;window.__appductShareShim=1;" +
             "var b=window.AndroidShareBridge;if(!b)return;" +
-            "navigator.share=function(d){try{d=d||{};b.share(String(d.title||''),String(d.text||''),String(d.url||''));return Promise.resolve();}catch(e){return Promise.reject(e);}};" +
+            "function _readFile(f){return new Promise(function(res,rej){var r=new FileReader();r.onloadend=function(){try{var s=String(r.result||'');var i=s.indexOf(',');res({name:f.name||'file',type:f.type||'application/octet-stream',data:i>=0?s.substring(i+1):''});}catch(e){rej(e);}};r.onerror=rej;r.readAsDataURL(f);});}" +
+            "navigator.share=function(d){try{d=d||{};if(d.files&&d.files.length){var fs=[].slice.call(d.files);return Promise.all(fs.map(_readFile)).then(function(arr){var first=arr[0]||{};b.shareBase64(first.data||'',first.name||'shared',first.type||'application/octet-stream',String(d.title||''),String(d.text||d.url||''));});}b.share(String(d.title||''),String(d.text||''),String(d.url||''));return Promise.resolve();}catch(e){return Promise.reject(e);}};" +
             "navigator.canShare=function(){return true;};" +
             "var SHARE_RE=/(^mailto:|^tel:|^sms:|^whatsapp:|^fb-messenger:|^tg:|^viber:|^intent:|^market:|^geo:|^skype:|wa\\.me\\/|api\\.whatsapp\\.com|web\\.whatsapp\\.com|whatsapp\\.com|chat\\.whatsapp\\.com|t\\.me\\/|telegram\\.me\\/|twitter\\.com\\/intent|x\\.com\\/intent|facebook\\.com\\/sharer|facebook\\.com\\/dialog\\/share|m\\.facebook\\.com\\/sharer|linkedin\\.com\\/sharing|linkedin\\.com\\/shareArticle|pinterest\\.com\\/pin\\/create|reddit\\.com\\/submit|mail\\.google\\.com\\/mail\\/\\?view=cm|messenger\\.com\\/share)/i;" +
             "function isShare(u){try{u=String(u||'');return !!u&&SHARE_RE.test(u);}catch(e){return false;}}" +
