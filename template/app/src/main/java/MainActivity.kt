@@ -76,6 +76,14 @@ class MainActivity : AppCompatActivity() {
     private var isShowingAppOpenAd: Boolean = false
     private var appOpenAdShownThisSession: Boolean = false
     private var mobileAdsInitialized: Boolean = false
+    // Interstitial throttling: only count real unique page navigations and enforce
+    // a minimum time gap between shows so redirects / SPA route churn / iframe main
+    // frame reloads don't fire an ad on "every page".
+    private var lastCountedAdUrl: String = ""
+    private var lastInterstitialShownAt: Long = 0L
+    private val interstitialMinIntervalMs: Long = 60_000L // never more than once per minute
+
+
 
 
 
@@ -524,7 +532,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 // AdMob: count this page load and possibly show an interstitial.
                 if (!url.isNullOrBlank() && url != "about:blank") {
-                    maybeShowInterstitial()
+                    maybeShowInterstitial(url)
                 }
             }
 
@@ -1909,6 +1917,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun initAdMobIfEnabled() {
         if (!admobEnabled) return
+        // Only guard against unresolved template placeholders / empty values so
+        // MobileAds.initialize() doesn't crash. Otherwise trust whatever App ID
+        // the user configured — if it's wrong AdMob will silently fail to serve
+        // ads, which is the intended behavior.
+        val appIdTrim = admobAppId.trim()
+        if (appIdTrim.isEmpty() || appIdTrim.startsWith("%%")) {
+            android.util.Log.w("AdMob", "Skipping AdMob init: App ID is empty or a placeholder.")
+            return
+        }
         try {
             com.google.android.gms.ads.MobileAds.initialize(this) {
                 mobileAdsInitialized = true
@@ -1923,7 +1940,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun isRealAdUnit(id: String): Boolean {
         val v = id.trim()
-        return v.isNotEmpty() && v != "none" && !v.startsWith("%%")
+        // Only reject empty/sentinel/placeholder values. Any other string is passed
+        // through to the SDK verbatim — invalid IDs will just silently fail to load.
+        if (v.isEmpty() || v.equals("none", ignoreCase = true) || v.startsWith("%%")) return false
+        return true
     }
 
     private fun loadBannerAd() {
@@ -1976,16 +1996,49 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun maybeShowInterstitial() {
+    private fun maybeShowInterstitial(url: String? = null) {
         if (!isRealAdUnit(admobInterstitialId)) return
         val interval = if (admobInterstitialInterval > 0) admobInterstitialInterval else 3
+
+        // 1. Dedupe: only count when this navigation resolves to a NEW page.
+        //    Normalize by scheme+host+path (ignore query/hash/trailing slash) so
+        //    redirects, hash routing, and refreshes don't each count as a page.
+        val key = normalizeUrlForAdCount(url)
+        if (key.isEmpty() || key == lastCountedAdUrl) return
+        lastCountedAdUrl = key
         pageLoadCounter += 1
         if (pageLoadCounter % interval != 0) return
+
+        // 2. Time throttle: never show more than once per interstitialMinIntervalMs,
+        //    regardless of counter — protects against ad-spam if a user rapidly
+        //    navigates.
+        val now = System.currentTimeMillis()
+        if (now - lastInterstitialShownAt < interstitialMinIntervalMs) return
+
         val ad = interstitialAd ?: run { loadInterstitialAd(); return }
-        try { ad.show(this) } catch (t: Throwable) {
+        try {
+            ad.show(this)
+            lastInterstitialShownAt = now
+        } catch (t: Throwable) {
             android.util.Log.w("AdMob", "Interstitial show failed: ${t.message}")
         }
     }
+
+    private fun normalizeUrlForAdCount(url: String?): String {
+        val u = url?.trim().orEmpty()
+        if (u.isEmpty() || u == "about:blank" || u.startsWith("data:") || u.startsWith("javascript:")) return ""
+        return try {
+            val parsed = Uri.parse(u)
+            val scheme = parsed.scheme?.lowercase() ?: ""
+            val host = parsed.host?.lowercase() ?: ""
+            var path = parsed.path ?: ""
+            if (path.length > 1 && path.endsWith("/")) path = path.dropLast(1)
+            "$scheme://$host$path"
+        } catch (_: Throwable) {
+            u
+        }
+    }
+
 
     private fun loadAppOpenAd() {
         if (!admobAppOpenEnabled || !isRealAdUnit(admobAppOpenId)) return
