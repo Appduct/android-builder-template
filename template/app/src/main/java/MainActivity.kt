@@ -76,12 +76,11 @@ class MainActivity : AppCompatActivity() {
     private var isShowingAppOpenAd: Boolean = false
     private var appOpenAdShownThisSession: Boolean = false
     private var mobileAdsInitialized: Boolean = false
-    // Interstitial throttling: only count real unique page navigations and enforce
-    // a minimum time gap between shows so redirects / SPA route churn / iframe main
-    // frame reloads don't fire an ad on "every page".
+    // Interstitial throttling: dedupe by normalized page URL so redirects / SPA
+    // route churn / iframe main frame reloads don't each count as a page. The
+    // configured `admobInterstitialInterval` is enforced strictly (counter resets
+    // to zero after each successful show).
     private var lastCountedAdUrl: String = ""
-    private var lastInterstitialShownAt: Long = 0L
-    private val interstitialMinIntervalMs: Long = 60_000L // never more than once per minute
 
 
 
@@ -1918,12 +1917,15 @@ class MainActivity : AppCompatActivity() {
     private fun initAdMobIfEnabled() {
         if (!admobEnabled) return
         // Only guard against unresolved template placeholders / empty values so
-        // MobileAds.initialize() doesn't crash. Otherwise trust whatever App ID
-        // the user configured — if it's wrong AdMob will silently fail to serve
-        // ads, which is the intended behavior.
+        // MobileAds.initialize() doesn't crash. Also refuse Google's public demo
+        // App ID so we never accidentally serve test ads in a shipped build.
         val appIdTrim = admobAppId.trim()
         if (appIdTrim.isEmpty() || appIdTrim.startsWith("%%")) {
             android.util.Log.w("AdMob", "Skipping AdMob init: App ID is empty or a placeholder.")
+            return
+        }
+        if (appIdTrim.equals("ca-app-pub-3940256099942544~3347511713", ignoreCase = true)) {
+            android.util.Log.w("AdMob", "Skipping AdMob init: Google demo App ID detected.")
             return
         }
         try {
@@ -1940,9 +1942,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun isRealAdUnit(id: String): Boolean {
         val v = id.trim()
-        // Only reject empty/sentinel/placeholder values. Any other string is passed
-        // through to the SDK verbatim — invalid IDs will just silently fail to load.
+        // Reject empty/sentinel/placeholder values and Google's public demo ad unit
+        // prefix (ca-app-pub-3940256099942544/...) so demo ads never ship.
         if (v.isEmpty() || v.equals("none", ignoreCase = true) || v.startsWith("%%")) return false
+        if (v.startsWith("ca-app-pub-3940256099942544/", ignoreCase = true)) return false
         return true
     }
 
@@ -2000,25 +2003,31 @@ class MainActivity : AppCompatActivity() {
         if (!isRealAdUnit(admobInterstitialId)) return
         val interval = if (admobInterstitialInterval > 0) admobInterstitialInterval else 3
 
-        // 1. Dedupe: only count when this navigation resolves to a NEW page.
-        //    Normalize by scheme+host+path (ignore query/hash/trailing slash) so
-        //    redirects, hash routing, and refreshes don't each count as a page.
+        // Dedupe: only count when this navigation resolves to a NEW page. Normalize
+        // by scheme+host+path (ignore query/hash/trailing slash) so redirects, hash
+        // routing, and refreshes don't each count as a page.
         val key = normalizeUrlForAdCount(url)
         if (key.isEmpty() || key == lastCountedAdUrl) return
         lastCountedAdUrl = key
         pageLoadCounter += 1
-        if (pageLoadCounter % interval != 0) return
 
-        // 2. Time throttle: never show more than once per interstitialMinIntervalMs,
-        //    regardless of counter — protects against ad-spam if a user rapidly
-        //    navigates.
-        val now = System.currentTimeMillis()
-        if (now - lastInterstitialShownAt < interstitialMinIntervalMs) return
+        // Strict interval: show exactly every `interval` unique pages. The counter
+        // is reset to 0 on a successful show so cadence stays consistent even if a
+        // previous attempt was skipped (e.g. ad not yet loaded).
+        if (pageLoadCounter < interval) return
 
-        val ad = interstitialAd ?: run { loadInterstitialAd(); return }
+        val ad = interstitialAd
+        if (ad == null) {
+            // Ad not ready — keep counter pegged at the threshold so the very next
+            // page shows the ad as soon as loading completes, instead of skipping
+            // ahead by another full interval.
+            pageLoadCounter = interval
+            loadInterstitialAd()
+            return
+        }
         try {
             ad.show(this)
-            lastInterstitialShownAt = now
+            pageLoadCounter = 0
         } catch (t: Throwable) {
             android.util.Log.w("AdMob", "Interstitial show failed: ${t.message}")
         }
