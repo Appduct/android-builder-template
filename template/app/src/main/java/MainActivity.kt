@@ -510,11 +510,13 @@ class MainActivity : AppCompatActivity() {
                 }
                 progressBar.visibility = View.GONE
                 injectNativeShareShim(view)
+                injectBiometricLoginShim(view)
             }
             override fun onPageFinished(view: WebView?, url: String?) {
                 progressBar.visibility = View.GONE
                 swipeRefresh.isRefreshing = false
                 injectNativeShareShim(view)
+                injectBiometricLoginShim(view)
                 try { CookieManager.getInstance().flush() } catch (_: Exception) {}
                 resetLandingRootHistoryIfNeeded(url)
                 dismissSplash()
@@ -1769,6 +1771,36 @@ class MainActivity : AppCompatActivity() {
             "}catch(e){}})();"
         try { view?.evaluateJavascript(js, null) } catch (_: Exception) {}
     }
+
+    /**
+     * Auto-wires "Sign in with biometrics" buttons on the wrapped web page to the native
+     * AndroidBiometric bridge. Sites don't need any code changes — any element matching
+     * common selectors (`[data-biometric-login]`, `#biometric-login`, `.biometric-login`,
+     * or a button whose visible text contains "biometric" / "fingerprint" / "face id" /
+     * "face unlock" / "touch id") is intercepted; on success we:
+     *   1. dispatch a `appduct:biometric-success` CustomEvent on window,
+     *   2. call `window.onBiometricLoginSuccess()` if defined,
+     *   3. click the element referenced by the button's `data-biometric-success-target`
+     *      selector (usually the real sign-in submit button), OR submit the closest form.
+     * The site can also call `window.appductBiometricLogin(cb)` directly.
+     */
+    private fun injectBiometricLoginShim(view: WebView?) {
+        if (!biometricEnabled) return
+        val js = "(function(){try{" +
+            "if(window.__appductBioShim)return;window.__appductBioShim=1;" +
+            "var b=window.AndroidBiometric;if(!b)return;" +
+            "function avail(){try{return !!(b.isAvailable&&b.isAvailable());}catch(e){return false;}}" +
+            "function run(cb){try{if(!avail()){cb&&cb('unavailable');return;}var name='__appductBioCb_'+Math.random().toString(36).slice(2);window[name]=function(r){try{delete window[name];}catch(e){}try{cb&&cb(r);}catch(e){}};b.authenticate(name);}catch(e){cb&&cb('error');}}" +
+            "window.appductBiometricLogin=run;" +
+            "function onSuccess(el){try{window.dispatchEvent(new CustomEvent('appduct:biometric-success'));}catch(e){}try{if(typeof window.onBiometricLoginSuccess==='function')window.onBiometricLoginSuccess();}catch(e){}try{var sel=el&&el.getAttribute&&el.getAttribute('data-biometric-success-target');if(sel){var t=document.querySelector(sel);if(t){t.click();return;}}var f=el&&el.closest&&el.closest('form');if(f){if(typeof f.requestSubmit==='function'){f.requestSubmit();}else{f.submit();}}}catch(e){}}" +
+            "var BIO_RE=/(biometric|fingerprint|face\\s*id|face\\s*unlock|touch\\s*id)/i;" +
+            "function isBioEl(el){try{if(!el||el.nodeType!==1)return false;if(el.matches&&el.matches('[data-biometric-login],#biometric-login,.biometric-login,[data-biometric]'))return true;var role=(el.getAttribute&&(el.getAttribute('aria-label')||''))||'';var txt=((el.innerText||el.textContent||'')+' '+role+' '+(el.title||'')+' '+(el.value||'')).trim();if(!txt)return false;if(txt.length>80)return false;return BIO_RE.test(txt);}catch(e){return false;}}" +
+            "function findBio(target){try{var t=target;var hops=0;while(t&&t!==document&&hops<5){if(isBioEl(t))return t;t=t.parentNode;hops++;}}catch(e){}return null;}" +
+            "document.addEventListener('click',function(ev){try{var el=findBio(ev.target);if(!el)return;if(el.__appductBioHandled)return;if(!avail())return;ev.preventDefault();ev.stopImmediatePropagation();ev.stopPropagation();el.__appductBioHandled=true;run(function(r){el.__appductBioHandled=false;if(r==='success')onSuccess(el);});}catch(e){}},true);" +
+            "}catch(e){}})();"
+        try { view?.evaluateJavascript(js, null) } catch (_: Exception) {}
+    }
+
 
 
 
