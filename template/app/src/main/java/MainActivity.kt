@@ -57,9 +57,9 @@ class MainActivity : AppCompatActivity() {
     // When false, any external-domain http(s) link is opened in the system browser
     // instead of inside this WebView.
     private val externalLinksInApp: Boolean = %%EXTERNAL_LINKS_IN_APP%%
-    // Require fingerprint / face / device credential before the app contents are shown.
+    // Enables the AndroidBiometric JS bridge so the wrapped web login page can trigger
+    // an OS fingerprint / face prompt. Never gates app startup.
     private val biometricEnabled: Boolean = %%BIOMETRIC_ENABLED%%
-    private var biometricAuthPassed: Boolean = false
 
     // AdMob — values templated at build time.
     private val admobEnabled: Boolean = %%ADMOB_ENABLED%%
@@ -269,89 +269,80 @@ class MainActivity : AppCompatActivity() {
         // Android 14+ causes the "Allow access to more photos and videos" partial-access
         // dialog to re-appear on every launch and screen flicker.
 
-        // Show splash while we (optionally) wait for biometric authentication.
+        // Biometric is NOT a startup gate — it is exposed to the wrapped web app so the
+        // login page can call window.AndroidBiometric.authenticate(...) when the user taps
+        // "Sign in with biometrics". App content loads immediately as usual.
         splashView.visibility = View.VISIBLE
         if (!landingEnabled) webView.visibility = View.INVISIBLE
 
-        runBiometricGate {
-            if (landingEnabled && setupLanding()) {
-                // Landing shown — skip auto-loading the website URL. Tile clicks load it.
+        if (landingEnabled && setupLanding()) {
+            // Landing shown — skip auto-loading the website URL. Tile clicks load it.
+        } else {
+            splashView.visibility = View.VISIBLE
+            webView.visibility = View.INVISIBLE
+
+            if (isNetworkAvailable()) {
+                loadUrl()
+            } else if (offlineModeEnabled) {
+                // Try cached version
+                webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                triedCacheFallback = true
+                loadUrl()
             } else {
-                splashView.visibility = View.VISIBLE
-                webView.visibility = View.INVISIBLE
-
-                if (isNetworkAvailable()) {
-                    loadUrl()
-                } else if (offlineModeEnabled) {
-                    // Try cached version
-                    webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
-                    triedCacheFallback = true
-                    loadUrl()
-                } else {
-                    dismissSplash()
-                    showError("Please check your internet connection and try again.")
-                }
+                dismissSplash()
+                showError("Please check your internet connection and try again.")
             }
-
-
-            syncHandler.removeCallbacks(syncRunnable)
-            syncHandler.post(syncRunnable)
-            startSyncRealtime()
-
-            // %%KEEP_ALIVE_START%%
         }
+
+        syncHandler.removeCallbacks(syncRunnable)
+        syncHandler.post(syncRunnable)
+        startSyncRealtime()
+
+        // %%KEEP_ALIVE_START%%
     }
 
     /**
-     * Gates app startup behind a biometric (or device-credential) prompt when the
-     * project has Biometric Login enabled. If the device has no biometric/credential
-     * enrolled, or the feature is off, the gate is bypassed silently.
+     * On-demand biometric prompt for the wrapped web login page. Triggered from JS via
+     *     window.AndroidBiometric.authenticate(callbackName)
+     * where `callbackName` is a global function on the page that will receive
+     * "success" / "failed" / "unavailable" / "cancelled" / "error:<msg>".
      */
-    private fun runBiometricGate(onSuccess: () -> Unit) {
-        if (biometricAuthPassed || !biometricEnabled) { onSuccess(); return }
+    private fun promptBiometric(onResult: (String) -> Unit) {
+        if (!biometricEnabled) { onResult("unavailable"); return }
         try {
             val authenticators = androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK
             val bm = androidx.biometric.BiometricManager.from(this)
-            val can = bm.canAuthenticate(authenticators)
-            if (can != androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS) {
-                // No fingerprint/face enrolled — fall through silently per spec.
-                biometricAuthPassed = true
-                onSuccess()
-                return
+            if (bm.canAuthenticate(authenticators) != androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS) {
+                onResult("unavailable"); return
             }
             val executor = androidx.core.content.ContextCompat.getMainExecutor(this)
             val appLabel = try { applicationInfo.loadLabel(packageManager).toString() } catch (_: Throwable) { "App" }
             val prompt = androidx.biometric.BiometricPrompt(this, executor,
                 object : androidx.biometric.BiometricPrompt.AuthenticationCallback() {
                     override fun onAuthenticationSucceeded(result: androidx.biometric.BiometricPrompt.AuthenticationResult) {
-                        biometricAuthPassed = true
-                        onSuccess()
+                        onResult("success")
                     }
+                    override fun onAuthenticationFailed() { /* keep prompt open — user can retry */ }
                     override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
                         when (errorCode) {
                             androidx.biometric.BiometricPrompt.ERROR_USER_CANCELED,
                             androidx.biometric.BiometricPrompt.ERROR_NEGATIVE_BUTTON,
-                            androidx.biometric.BiometricPrompt.ERROR_CANCELED -> finish()
+                            androidx.biometric.BiometricPrompt.ERROR_CANCELED -> onResult("cancelled")
                             androidx.biometric.BiometricPrompt.ERROR_LOCKOUT,
-                            androidx.biometric.BiometricPrompt.ERROR_LOCKOUT_PERMANENT -> finish()
-                            else -> {
-                                // Hardware/unknown error — don't lock the user out forever.
-                                biometricAuthPassed = true
-                                onSuccess()
-                            }
+                            androidx.biometric.BiometricPrompt.ERROR_LOCKOUT_PERMANENT -> onResult("failed")
+                            else -> onResult("error:" + errString.toString())
                         }
                     }
                 })
             val info = androidx.biometric.BiometricPrompt.PromptInfo.Builder()
-                .setTitle("Unlock $appLabel")
-                .setSubtitle("Authenticate to continue")
+                .setTitle("Sign in to $appLabel")
+                .setSubtitle("Use your fingerprint or face to continue")
                 .setAllowedAuthenticators(authenticators)
                 .setNegativeButtonText("Cancel")
                 .build()
             prompt.authenticate(info)
-        } catch (_: Throwable) {
-            biometricAuthPassed = true
-            onSuccess()
+        } catch (t: Throwable) {
+            onResult("error:" + (t.message ?: t.javaClass.simpleName))
         }
     }
 
@@ -444,6 +435,9 @@ class MainActivity : AppCompatActivity() {
         }
         // Expose a native share bridge so navigator.share() opens the OS share sheet
         try { webView.addJavascriptInterface(NativeShareBridge(), "AndroidShareBridge") } catch (_: Exception) {}
+        // Expose biometric auth bridge so the wrapped login page can trigger the OS
+        // fingerprint / face prompt from a "Sign in with biometrics" button.
+        try { webView.addJavascriptInterface(NativeBiometricBridge(), "AndroidBiometric") } catch (_: Exception) {}
 
         // Enable file downloads triggered from the wrapped site (links with download attr,
         // Content-Disposition: attachment, generated PDFs, images, etc). For http(s) URLs we
@@ -1553,6 +1547,43 @@ class MainActivity : AppCompatActivity() {
         prewarmWebView = null
         // %%KEEP_ALIVE_STOP%%
         super.onDestroy()
+    }
+
+    /**
+     * JS bridge exposed as `AndroidBiometric` — the wrapped login page can call
+     *     window.AndroidBiometric.isAvailable()
+     *     window.AndroidBiometric.authenticate("myCallback")
+     * The result string ("success" | "failed" | "cancelled" | "unavailable" | "error:...")
+     * is delivered by invoking `window[callbackName](result)`.
+     */
+    inner class NativeBiometricBridge {
+        @android.webkit.JavascriptInterface
+        fun isAvailable(): Boolean {
+            if (!biometricEnabled) return false
+            return try {
+                val bm = androidx.biometric.BiometricManager.from(this@MainActivity)
+                bm.canAuthenticate(androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK) ==
+                    androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS
+            } catch (_: Throwable) { false }
+        }
+
+        @android.webkit.JavascriptInterface
+        fun authenticate(callbackName: String?) {
+            runOnUiThread {
+                promptBiometric { result ->
+                    try {
+                        val safeName = (callbackName ?: "").filter { it.isLetterOrDigit() || it == '_' || it == '$' }
+                        val escaped = result.replace("\\", "\\\\").replace("'", "\\'")
+                        val js = if (safeName.isNotEmpty())
+                            "try{window['$safeName'] && window['$safeName']('$escaped');}catch(e){};" +
+                            "try{window.dispatchEvent(new CustomEvent('android-biometric-result',{detail:'$escaped'}));}catch(e){};"
+                        else
+                            "try{window.dispatchEvent(new CustomEvent('android-biometric-result',{detail:'$escaped'}));}catch(e){};"
+                        webView.evaluateJavascript(js, null)
+                    } catch (_: Throwable) {}
+                }
+            }
+        }
     }
 
     /**
