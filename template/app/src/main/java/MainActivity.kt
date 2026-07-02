@@ -1786,28 +1786,41 @@ class MainActivity : AppCompatActivity() {
      */
     private fun injectBiometricLoginShim(view: WebView?) {
         if (!biometricEnabled) return
-        val js = "(function(){try{" +
-            "if(window.__appductBioShim)return;window.__appductBioShim=1;" +
-            "var b=window.AndroidBiometric;if(!b)return;" +
-            "var KEY='__appductBioCreds_'+location.origin;" +
-            "function avail(){try{return !!(b.isAvailable&&b.isAvailable());}catch(e){return false;}}" +
-            "function run(cb){try{if(!avail()){cb&&cb('unavailable');return;}var name='__appductBioCb_'+Math.random().toString(36).slice(2);window[name]=function(r){try{delete window[name];}catch(e){}try{cb&&cb(r);}catch(e){}};b.authenticate(name);}catch(e){cb&&cb('error');}}" +
-            "window.appductBiometricLogin=run;" +
-            "function q(sel,root){try{return (root||document).querySelector(sel);}catch(e){return null;}}" +
-            "function findPass(root){return q('input[type=password]:not([disabled])',root);}" +
-            "function findUser(form){if(!form)return null;var sels=['input[type=email]','input[name*=email i]','input[name*=user i]','input[name*=login i]','input[id*=email i]','input[id*=user i]','input[autocomplete=username]','input[autocomplete=email]','input[type=tel]','input[type=text]'];for(var i=0;i<sels.length;i++){var el=q(sels[i],form);if(el&&!el.disabled)return el;}return null;}" +
-            "function setVal(el,v){try{var proto=Object.getPrototypeOf(el);var d=Object.getOwnPropertyDescriptor(proto,'value')||Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');if(d&&d.set){d.set.call(el,v);}else{el.value=v;}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}catch(e){try{el.value=v;}catch(e2){}}}" +
-            "function saveCreds(u,p){try{if(!u||!p)return;localStorage.setItem(KEY,JSON.stringify({u:u,p:p,t:Date.now()}));}catch(e){}}" +
-            "function loadCreds(){try{var s=localStorage.getItem(KEY);return s?JSON.parse(s):null;}catch(e){return null;}}" +
-            "document.addEventListener('submit',function(ev){try{var f=ev.target;if(!f||f.tagName!=='FORM')return;var pw=findPass(f);if(!pw||!pw.value)return;var u=findUser(f);if(!u||!u.value)return;saveCreds(u.value,pw.value);}catch(e){}},true);" +
-            "document.addEventListener('click',function(ev){try{var t=ev.target;if(!t||!t.closest)return;var btn=t.closest('button,[type=submit],input[type=submit]');if(!btn)return;var f=btn.form||btn.closest('form');if(!f)return;var pw=findPass(f);var u=findUser(f);if(pw&&pw.value&&u&&u.value)saveCreds(u.value,pw.value);}catch(e){}},true);" +
-            "function autofillAndSubmit(el){try{var creds=loadCreds();var form=(el&&el.closest&&el.closest('form'))||null;var pw=form?findPass(form):findPass(document);if(pw&&!form)form=pw.closest('form');var user=form?findUser(form):null;if(creds&&pw&&user){setVal(user,creds.u);setVal(pw,creds.p);}var sel=el&&el.getAttribute&&el.getAttribute('data-biometric-success-target');if(sel){var tg=q(sel);if(tg){tg.click();return;}}if(form){var sb=q('button[type=submit],input[type=submit]',form)||q('button',form);if(sb){sb.click();return;}if(typeof form.requestSubmit==='function'){form.requestSubmit();}else{form.submit();}}}catch(e){}}" +
-            "function onSuccess(el){try{window.dispatchEvent(new CustomEvent('appduct:biometric-success'));}catch(e){}try{if(typeof window.onBiometricLoginSuccess==='function'){window.onBiometricLoginSuccess();return;}}catch(e){}autofillAndSubmit(el);}" +
-            "var BIO_RE=/(biometric|fingerprint|face\\s*id|face\\s*unlock|touch\\s*id)/i;" +
-            "function isBioEl(el){try{if(!el||el.nodeType!==1)return false;if(el.matches&&el.matches('[data-biometric-login],#biometric-login,.biometric-login,[data-biometric]'))return true;var role=(el.getAttribute&&(el.getAttribute('aria-label')||''))||'';var txt=((el.innerText||el.textContent||'')+' '+role+' '+(el.title||'')+' '+(el.value||'')).trim();if(!txt)return false;if(txt.length>80)return false;return BIO_RE.test(txt);}catch(e){return false;}}" +
-            "function findBio(target){try{var t=target;var hops=0;while(t&&t!==document&&hops<5){if(isBioEl(t))return t;t=t.parentNode;hops++;}}catch(e){}return null;}" +
-            "document.addEventListener('click',function(ev){try{var el=findBio(ev.target);if(!el)return;if(el.__appductBioHandled)return;if(!avail())return;ev.preventDefault();ev.stopImmediatePropagation();ev.stopPropagation();el.__appductBioHandled=true;run(function(r){el.__appductBioHandled=false;if(r==='success')onSuccess(el);});}catch(e){}},true);" +
-            "}catch(e){}})();"
+        val js = """
+            (function(){try{
+            if(window.__appductBioShim)return;window.__appductBioShim=1;
+            var b=window.AndroidBiometric;if(!b)return;
+            var KEY='__appductBioCreds_'+location.origin;
+            var nativeToast=(window.AndroidShareBridge&&window.AndroidShareBridge.toast)?function(m){try{window.AndroidShareBridge.toast(m);}catch(e){}}:function(){};
+            function avail(){try{return !!(b.isAvailable&&b.isAvailable());}catch(e){return false;}}
+            function run(cb){try{if(!avail()){cb&&cb('unavailable');return;}var name='__appductBioCb_'+Math.random().toString(36).slice(2);window[name]=function(r){try{delete window[name];}catch(e){}try{cb&&cb(r);}catch(e){}};b.authenticate(name);}catch(e){cb&&cb('error');}}
+            window.appductBiometricLogin=run;
+            function q(sel,root){try{return (root||document).querySelector(sel);}catch(e){return null;}}
+            function qa(sel,root){try{return Array.prototype.slice.call((root||document).querySelectorAll(sel));}catch(e){return [];}}
+            function visible(el){try{if(!el||el.disabled)return false;var s=getComputedStyle(el);var r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;}catch(e){return !!el&&!el.disabled;}}
+            function firstVisible(sel,root){var a=qa(sel,root);for(var i=0;i<a.length;i++){if(visible(a[i]))return a[i];}return null;}
+            function findPass(root){return firstVisible('input[type=password]:not([disabled]):not([aria-hidden=true])',root);}
+            function findUser(root){if(!root)return null;var sels=['input[type=email]','input[name*=email i]','input[name*=user i]','input[name*=login i]','input[id*=email i]','input[id*=user i]','input[autocomplete=username]','input[autocomplete=email]','input[type=tel]','input[type=text]'];for(var i=0;i<sels.length;i++){var el=firstVisible(sels[i],root);if(el)return el;}return null;}
+            function setVal(el,v){try{var proto=Object.getPrototypeOf(el);var d=Object.getOwnPropertyDescriptor(proto,'value')||Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');if(d&&d.set){d.set.call(el,v);}else{el.value=v;}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}catch(e){try{el.value=v;}catch(e2){}}}
+            function saveCreds(u,p){try{if(!u||!p)return;localStorage.setItem(KEY,JSON.stringify({u:u,p:p,t:Date.now()}));}catch(e){}}
+            function loadCreds(){try{var s=localStorage.getItem(KEY);return s?JSON.parse(s):null;}catch(e){return null;}}
+            function ensureSilentStyle(){try{if(document.getElementById('__appductBioStyle'))return;var st=document.createElement('style');st.id='__appductBioStyle';st.textContent='html.__appductBioSubmitting input[data-appduct-bio-filled="1"]{color:transparent!important;-webkit-text-fill-color:transparent!important;caret-color:transparent!important;text-shadow:none!important;}html.__appductBioSubmitting input[data-appduct-bio-filled="1"]::selection{background:transparent!important;color:transparent!important;}';document.head.appendChild(st);}catch(e){}}
+            function beginSilent(fields){try{ensureSilentStyle();for(var i=0;i<fields.length;i++){fields[i].setAttribute('data-appduct-bio-filled','1');}document.documentElement.classList.add('__appductBioSubmitting');}catch(e){}}
+            function endSilent(clear){try{var fields=qa('input[data-appduct-bio-filled="1"]');for(var i=0;i<fields.length;i++){if(clear)setVal(fields[i],'');fields[i].removeAttribute('data-appduct-bio-filled');}document.documentElement.classList.remove('__appductBioSubmitting');}catch(e){}}
+            function findScope(el){try{var n=el;for(var i=0;n&&n!==document&&i<8;i++,n=n.parentElement){if(findPass(n)&&findUser(n))return n;}var forms=qa('form');for(var j=0;j<forms.length;j++){if(findPass(forms[j])&&findUser(forms[j]))return forms[j];}}catch(e){}return document;}
+            function findSubmit(scope,bioEl){try{var sels='button[type=submit],input[type=submit],button:not([disabled]),[role=button]:not([disabled])';var a=qa(sels,scope);var LOGIN_RE=/(log\s*in|sign\s*in|submit|continue|next)/i;for(var i=0;i<a.length;i++){var el=a[i];if(el===bioEl||!visible(el)||isBioEl(el))continue;var txt=((el.innerText||el.textContent||'')+' '+(el.value||'')+' '+(el.getAttribute('aria-label')||'')).trim();if(el.type==='submit'||LOGIN_RE.test(txt))return el;}}catch(e){}return null;}
+            function capture(root){try{var scope=root||document;var pw=findPass(scope);var u=findUser(scope);if(pw&&pw.value&&u&&u.value)saveCreds(u.value,pw.value);}catch(e){}}
+            document.addEventListener('submit',function(ev){try{capture(ev.target);}catch(e){}},true);
+            document.addEventListener('click',function(ev){try{var t=ev.target;if(!t||!t.closest)return;var btn=t.closest('button,[type=submit],input[type=submit],[role=button]');if(!btn)return;capture(btn.form||btn.closest('form')||findScope(btn));}catch(e){}},true);
+            function missing(reason){try{window.dispatchEvent(new CustomEvent('appduct:biometric-credentials-missing',{detail:reason||'credentials'}));}catch(e){}nativeToast('Sign in once with email and password to enable biometric login.');}
+            function submitSilently(el){try{var creds=loadCreds();if(!creds||!creds.u||!creds.p){missing('credentials');return false;}var scope=findScope(el);var pw=findPass(scope)||findPass(document);var user=findUser(scope)||findUser(document);if(!pw||!user){missing('fields');return false;}var form=(pw.form||user.form||(scope&&scope.tagName==='FORM'?scope:null)||(el&&el.closest&&el.closest('form')));var start=location.href;beginSilent([user,pw]);setVal(user,creds.u);setVal(pw,creds.p);try{user.blur();pw.blur();}catch(e){}setTimeout(function(){try{var sel=el&&el.getAttribute&&el.getAttribute('data-biometric-success-target');var target=sel?q(sel):null;if(target){target.click();}else{var sb=findSubmit(form||scope,el);if(sb){sb.click();}else if(form){if(typeof form.requestSubmit==='function')form.requestSubmit();else form.submit();}else{endSilent(true);missing('submit');return;}}setTimeout(function(){try{if(location.href===start)endSilent(true);}catch(e){}},10000);}catch(e){endSilent(true);missing('submit');}},80);return true;}catch(e){endSilent(true);missing('error');return false;}}
+            function onSuccess(el){try{window.dispatchEvent(new CustomEvent('appduct:biometric-success'));}catch(e){}var handled=false;try{if(typeof window.onBiometricLoginSuccess==='function'){handled=window.onBiometricLoginSuccess()===true;}}catch(e){}if(!handled)submitSilently(el);}
+            var BIO_RE=/(biometric|fingerprint|face\s*id|face\s*unlock|touch\s*id)/i;
+            function isBioEl(el){try{if(!el||el.nodeType!==1)return false;if(el.matches&&el.matches('[data-biometric-login],#biometric-login,.biometric-login,[data-biometric]'))return true;var role=(el.getAttribute&&(el.getAttribute('aria-label')||''))||'';var txt=((el.innerText||el.textContent||'')+' '+role+' '+(el.title||'')+' '+(el.value||'')).trim();if(!txt)return false;if(txt.length>80)return false;return BIO_RE.test(txt);}catch(e){return false;}}
+            function findBio(target){try{var t=target;var hops=0;while(t&&t!==document&&hops<5){if(isBioEl(t))return t;t=t.parentNode;hops++;}}catch(e){}return null;}
+            document.addEventListener('click',function(ev){try{var el=findBio(ev.target);if(!el)return;if(el.__appductBioHandled)return;if(!avail())return;ev.preventDefault();ev.stopImmediatePropagation();ev.stopPropagation();el.__appductBioHandled=true;run(function(r){el.__appductBioHandled=false;if(r==='success')onSuccess(el);});}catch(e){}},true);
+            }catch(e){}})();
+        """.trimIndent()
         try { view?.evaluateJavascript(js, null) } catch (_: Exception) {}
     }
 
