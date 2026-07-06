@@ -753,6 +753,16 @@ class MainActivity : AppCompatActivity() {
                 window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
             }
 
+            // Return a 1x1 transparent bitmap so WebView does NOT overlay its default gray
+            // "play triangle on gray gradient" placeholder on top of <video> elements. This
+            // lets the site's own poster="" image (or CSS background-color like black) show
+            // through — otherwise the built app appears to "refuse" the poster the site set.
+            override fun getDefaultVideoPoster(): Bitmap? {
+                return try {
+                    Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+                } catch (_: Exception) { super.getDefaultVideoPoster() }
+            }
+
             // Suppress the native "Confirm Navigation" dialog that the WebView would otherwise
             // show whenever the wrapped page (or our own reload) triggers a JS `beforeunload`
             // handler. Many sites attach beforeunload for analytics/forms, and combined with our
