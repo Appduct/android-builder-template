@@ -20,8 +20,24 @@
          on every launch. -->
 
 
+    <!-- All hardware features declared optional so Google Play does NOT filter the
+         app out on Wi-Fi-only tablets, Chromebooks, Android TV, or other devices
+         that lack a camera / microphone / GPS / touchscreen. Requesting the
+         permissions above (CAMERA, RECORD_AUDIO, ACCESS_*_LOCATION) would
+         otherwise implicitly require the matching hardware. -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+    <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+    <uses-feature android:name="android.hardware.location.network" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+    <uses-feature android:name="android.hardware.wifi" android:required="false" />
+    <uses-feature android:name="android.hardware.fingerprint" android:required="false" />
+    <uses-feature android:name="android.hardware.faketouch" android:required="false" />
 
     <queries>
         <package android:name="com.whatsapp" />
