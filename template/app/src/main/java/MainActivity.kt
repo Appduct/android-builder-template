@@ -157,6 +157,19 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Tablet fix: on devices with smallestScreenWidthDp >= 600 (7"+ tablets, Chromebooks,
+        // foldables in outer state, Android TV), never enforce the manifest's portrait lock.
+        // On Android 14/15, targetSdk 35 + a hard portrait lock on a landscape-primary tablet
+        // causes the activity to be letterboxed and the WebView to be laid out at 0 height
+        // before the first paint, which looks like a "blank page". Releasing the lock lets
+        // the tablet render the WebView at its natural size.
+        try {
+            if (resources.configuration.smallestScreenWidthDp >= 600) {
+                requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
+        } catch (_: Throwable) {}
+
+
         // Register file chooser result handler
         fileChooserLauncher = registerForActivityResult(
             ActivityResultContracts.StartActivityForResult()
