@@ -750,15 +750,20 @@ class MainActivity : AppCompatActivity() {
                 swipeRefresh.visibility = View.GONE
                 bottomNav.visibility = View.GONE
                 // Save the current orientation lock so we can restore it when the user exits
-                // fullscreen. During fullscreen video/media playback we release the lock and
-                // switch to SCREEN_ORIENTATION_SENSOR so the video can auto-rotate to landscape
-                // (and back) based on how the device is being held — matching native player UX.
+                // fullscreen. During fullscreen video/media playback we force landscape via
+                // SCREEN_ORIENTATION_SENSOR_LANDSCAPE — this rotates to landscape regardless of
+                // the user's system-level auto-rotate setting (which SENSOR would otherwise
+                // respect), and still allows flipping between the two landscape orientations
+                // based on how the device is held. Matches YouTube / native player UX.
                 preFullscreenOrientation = requestedOrientation
-                requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR
+                requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 window.decorView.systemUiVisibility = (
                     View.SYSTEM_UI_FLAG_FULLSCREEN
                     or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                     or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                 )
             }
             override fun onHideCustomView() {
@@ -773,6 +778,7 @@ class MainActivity : AppCompatActivity() {
                 // Restore the pre-fullscreen orientation lock (e.g. portrait) so the app UI
                 // returns to its configured orientation after the video closes.
                 requestedOrientation = preFullscreenOrientation
+                
                 window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
             }
 
