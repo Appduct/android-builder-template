@@ -593,12 +593,14 @@ class MainActivity : AppCompatActivity() {
                 progressBar.visibility = View.GONE
                 injectNativeShareShim(view)
                 injectBiometricLoginShim(view)
+                injectRealtimeCompletionShim(view)
             }
             override fun onPageFinished(view: WebView?, url: String?) {
                 progressBar.visibility = View.GONE
                 swipeRefresh.isRefreshing = false
                 injectNativeShareShim(view)
                 injectBiometricLoginShim(view)
+                injectRealtimeCompletionShim(view)
                 try { CookieManager.getInstance().flush() } catch (_: Exception) {}
                 resetLandingRootHistoryIfNeeded(url)
                 dismissSplash()
@@ -1949,8 +1951,79 @@ class MainActivity : AppCompatActivity() {
         try { view?.evaluateJavascript(js, null) } catch (_: Exception) {}
     }
 
-
-
+    /**
+     * Some wrapped apps complete a save/upload, show a success toast, then rely on a
+     * browser focus / visibility / realtime revalidation to update the previous list
+     * screen. Android's file picker + SwipeRefreshLayout can briefly suspend the WebView,
+     * so the first completion event is easy to miss. Observe successful save/upload toasts
+     * inside the page and immediately trigger the same revalidation signals a browser tab
+     * would emit; for document-upload workflows, fall back to one automatic route reload so
+     * the user never has to manually pull-to-refresh before the next stage unlocks.
+     */
+    private fun injectRealtimeCompletionShim(view: WebView?) {
+        val js = """
+            (function(){try{
+              if(window.__appductRealtimeCompletionShim)return;window.__appductRealtimeCompletionShim=1;
+              var lastAt=0,reloadQueued=false;
+              function emit(name,detail){try{window.dispatchEvent(new CustomEvent(name,{detail:detail||{}}));}catch(e){try{window.dispatchEvent(new Event(name));}catch(_){}}}
+              function browserNudge(reason){
+                try{Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return 'visible';}});}catch(e){}
+                try{Object.defineProperty(document,'hidden',{configurable:true,get:function(){return false;}});}catch(e){}
+                try{document.dispatchEvent(new Event('visibilitychange'));}catch(e){}
+                try{window.dispatchEvent(new Event('focus'));}catch(e){}
+                try{window.dispatchEvent(new Event('online'));}catch(e){}
+                try{window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:false}));}catch(e){try{window.dispatchEvent(new Event('pageshow'));}catch(_){}}
+                emit('app-resumed',{source:'appduct',reason:reason});
+                emit('appduct:revalidate',{source:'appduct',reason:reason});
+                emit('appduct:upload-complete',{source:'appduct',reason:reason});
+                try{if(navigator.serviceWorker&&navigator.serviceWorker.controller)navigator.serviceWorker.controller.postMessage({type:'appduct:revalidate',reason:reason});}catch(e){}
+              }
+              function isBusy(){try{
+                var ae=document.activeElement;if(ae){var t=(ae.tagName||'').toLowerCase();if(t==='input'||t==='textarea'||t==='select'||ae.isContentEditable)return true;}
+                if(document.querySelector('[aria-busy="true"],[data-loading="true"],[data-pending="true"],[data-uploading="true"],.loading,.uploading,.pending,.spinner,.progress'))return true;
+                return false;
+              }catch(e){return true;}}
+              function inDocumentWorkflow(){try{
+                var text=((document.body&&document.body.innerText)||'').slice(0,12000)+' '+location.href;
+                return /(upload\s+documents?|driver'?s?\s+licen[cs]e|vehicle\s+(details|documents)|document\s+(upload|verification|review))/i.test(text);
+              }catch(e){return false;}}
+              function queueDocumentReload(){
+                if(reloadQueued||!inDocumentWorkflow())return;reloadQueued=true;
+                setTimeout(function(){try{if(!isBusy())location.reload();else reloadQueued=false;}catch(e){reloadQueued=false;}},1400);
+              }
+              function looksLikeCompletion(text){try{
+                text=String(text||'').replace(/\s+/g,' ').trim();
+                if(!text||text.length>700)return false;
+                var ok=/(success|successful|successfully|saved|saving complete|uploaded|upload complete|completed|submitted)/i.test(text);
+                var relevant=/(save|saved|saving|upload|uploaded|document|driver|licen[cs]e|vehicle|stage|details|submission)/i.test(text);
+                return ok&&relevant;
+              }catch(e){return false;}}
+              function handle(text){
+                if(!looksLikeCompletion(text))return;
+                var now=Date.now();if(now-lastAt<2500)return;lastAt=now;
+                browserNudge('success-toast');
+                setTimeout(function(){browserNudge('success-toast-delayed');},450);
+                setTimeout(function(){browserNudge('success-toast-final');queueDocumentReload();},1000);
+              }
+              function scanNode(n){try{
+                if(!n)return;
+                if(n.nodeType===3){handle(n.nodeValue||'');return;}
+                if(n.nodeType!==1)return;
+                var role=(n.getAttribute&&((n.getAttribute('role')||'')+' '+(n.getAttribute('aria-live')||'')+' '+(n.className||'')))||'';
+                var text=(n.innerText||n.textContent||'').trim();
+                if(/toast|alert|status|snackbar|notification|sonner/i.test(role)||looksLikeCompletion(text))handle(text);
+              }catch(e){}}
+              function start(){try{
+                if(!document.body){setTimeout(start,250);return;}
+                var mo=new MutationObserver(function(list){try{for(var i=0;i<list.length;i++){var m=list[i];scanNode(m.target);for(var j=0;j<m.addedNodes.length;j++)scanNode(m.addedNodes[j]);}}catch(e){}});
+                mo.observe(document.body,{childList:true,subtree:true,characterData:true});
+                scanNode(document.body);
+              }catch(e){}}
+              start();
+            }catch(e){}})();
+        """.trimIndent()
+        try { view?.evaluateJavascript(js, null) } catch (_: Exception) {}
+    }
 
     private fun showError(message: String) {
         try {
