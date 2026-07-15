@@ -82,6 +82,21 @@ class MainActivity : AppCompatActivity() {
     // to zero after each successful show).
     private var lastCountedAdUrl: String = ""
 
+    // Google Play in-app updates — surface a "new version available" prompt when the
+    // Play Store has published a newer versionCode than the one currently installed.
+    // Uses the FLEXIBLE flow so the user can continue using the app while the update
+    // downloads in the background, then a dialog asks them to restart to apply it.
+    private var appUpdateManager: com.google.android.play.core.appupdate.AppUpdateManager? = null
+    private val appUpdateRequestCode = 1729
+    private val appUpdateListener = com.google.android.play.core.install.InstallStateUpdatedListener { state ->
+        try {
+            if (state.installStatus() == com.google.android.play.core.install.model.InstallStatus.DOWNLOADED) {
+                showAppUpdateReadyPrompt()
+            }
+        } catch (_: Throwable) {}
+    }
+
+
 
 
 
@@ -312,8 +327,61 @@ class MainActivity : AppCompatActivity() {
         syncHandler.post(syncRunnable)
         startSyncRealtime()
 
+        // Prompt the user when a newer version of this app is live on Google Play.
+        try { checkForPlayStoreUpdate() } catch (_: Throwable) {}
+
         // %%KEEP_ALIVE_START%%
     }
+
+    /**
+     * Ask Google Play whether a newer versionCode is available for this app and, if so,
+     * start the FLEXIBLE in-app update flow. Safe no-op on non-Play installs (sideload,
+     * F-Droid) or when Play Services is missing — those cases just throw and get swallowed.
+     */
+    private fun checkForPlayStoreUpdate() {
+        try {
+            val mgr = com.google.android.play.core.appupdate.AppUpdateManagerFactory.create(this)
+            appUpdateManager = mgr
+            mgr.registerListener(appUpdateListener)
+            mgr.appUpdateInfo.addOnSuccessListener { info ->
+                try {
+                    val available = info.updateAvailability() ==
+                        com.google.android.play.core.install.model.UpdateAvailability.UPDATE_AVAILABLE
+                    val allowsFlexible = info.isUpdateTypeAllowed(
+                        com.google.android.play.core.install.model.AppUpdateType.FLEXIBLE
+                    )
+                    if (available && allowsFlexible) {
+                        mgr.startUpdateFlowForResult(
+                            info,
+                            com.google.android.play.core.install.model.AppUpdateType.FLEXIBLE,
+                            this,
+                            appUpdateRequestCode
+                        )
+                    } else if (info.installStatus() ==
+                        com.google.android.play.core.install.model.InstallStatus.DOWNLOADED) {
+                        // Update was already downloaded in a previous session — prompt to install.
+                        showAppUpdateReadyPrompt()
+                    }
+                } catch (_: Throwable) {}
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun showAppUpdateReadyPrompt() {
+        try {
+            val appName = try { applicationInfo.loadLabel(packageManager).toString() } catch (_: Throwable) { "App" }
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("Update available")
+                .setMessage("A new version of $appName has been downloaded. Restart to apply the update.")
+                .setPositiveButton("Restart now") { _, _ ->
+                    try { appUpdateManager?.completeUpdate() } catch (_: Throwable) {}
+                }
+                .setNegativeButton("Later", null)
+                .setCancelable(true)
+                .show()
+        } catch (_: Throwable) {}
+    }
+
 
     /**
      * On-demand biometric prompt for the wrapped web login page. Triggered from JS via
@@ -1393,7 +1461,19 @@ class MainActivity : AppCompatActivity() {
         if (lastPauseTime > 0L && !isPickingFile) {
             showAppOpenAdIfAvailable()
         }
+
+        // If a Play Store update finished downloading while the app was backgrounded,
+        // surface the "restart to apply" prompt now.
+        try {
+            appUpdateManager?.appUpdateInfo?.addOnSuccessListener { info ->
+                if (info.installStatus() ==
+                    com.google.android.play.core.install.model.InstallStatus.DOWNLOADED) {
+                    showAppUpdateReadyPrompt()
+                }
+            }
+        } catch (_: Throwable) {}
     }
+
 
     override fun onPause() {
         super.onPause()
@@ -1586,9 +1666,11 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         try { prewarmWebView?.destroy() } catch (_: Exception) {}
         prewarmWebView = null
+        try { appUpdateManager?.unregisterListener(appUpdateListener) } catch (_: Throwable) {}
         // %%KEEP_ALIVE_STOP%%
         super.onDestroy()
     }
+
 
     /**
      * JS bridge exposed as `AndroidBiometric` — the wrapped login page can call
