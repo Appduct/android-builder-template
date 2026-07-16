@@ -150,6 +150,8 @@ class MainActivity : AppCompatActivity() {
     private var lastSignalAt: String = ""
     private var syncSignalInitialized: Boolean = false
     private var lastSyncReloadAt: Long = 0L
+    private var completionReloadQueued: Boolean = false
+    private var lastCompletionReloadRequestAt: Long = 0L
     private var syncSocket: WebSocket? = null
     private var syncRefCounter: Int = 1
     private val syncHttpClient: OkHttpClient by lazy {
@@ -1376,8 +1378,10 @@ class MainActivity : AppCompatActivity() {
     private fun loadFreshWebsite() {
         try {
             webView.stopLoading()
-            webView.clearCache(true)
-            webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+            // Browser-equivalent behavior: do not clear WebView/Service Worker cache or
+            // force LOAD_NO_CACHE for every request. That breaks realtime/status pollers
+            // in wrapped apps. Cache-bust only the top-level navigation URL.
+            webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
             val currentUrl = webView.url ?: websiteUrl
             val parsed = Uri.parse(currentUrl)
             val builder = parsed.buildUpon().clearQuery()
@@ -1396,6 +1400,66 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {
             try { webView.reload() } catch (_: Exception) {}
         }
+    }
+
+
+    /** Completion-toast refresh path; independent of the native pull-to-refresh toggle. */
+    private fun requestCompletionRevalidation(reason: String? = null) {
+        if (!::webView.isInitialized || isPickingFile || !isNetworkAvailable()) return
+        val now = System.currentTimeMillis()
+        if (completionReloadQueued || now - lastCompletionReloadRequestAt < 2500L) {
+            try { nudgePageToReconnectAndRefetch() } catch (_: Exception) {}
+            return
+        }
+        completionReloadQueued = true
+        lastCompletionReloadRequestAt = now
+        try { nudgePageToReconnectAndRefetch() } catch (_: Exception) {}
+        syncHandler.postDelayed({
+            completionReloadQueued = false
+            if (!::webView.isInitialized || isPickingFile || !isNetworkAvailable()) return@postDelayed
+            isPageSafeForCompletionRefresh { safe ->
+                if (!safe) return@isPageSafeForCompletionRefresh
+                val recheckAt = System.currentTimeMillis()
+                if (recheckAt - lastSyncReloadAt < 1800L) return@isPageSafeForCompletionRefresh
+                lastSyncReloadAt = recheckAt
+                try { loadFreshWebsite() } catch (_: Exception) {}
+            }
+        }, 1800L)
+    }
+
+    private fun isPageSafeForCompletionRefresh(callback: (Boolean) -> Unit) {
+        if (isPickingFile || fullscreenView != null) { callback(false); return }
+        val js = """(function(){try{
+            var ae=document.activeElement;
+            if(ae){var t=(ae.tagName||'').toLowerCase();var ty=(ae.type||'').toLowerCase();if((t==='input'&&ty!=='file')||t==='textarea'||t==='select'||ae.isContentEditable)return 'busy';}
+            var busy=document.querySelector('[aria-busy="true"],[data-loading="true"],[data-saving="true"],[data-submitting="true"],[data-pending="true"],[data-uploading="true"]');
+            if(busy)return 'busy';
+            var m=document.querySelectorAll('video,audio');
+            for(var i=0;i<m.length;i++){if(!m[i].paused&&!m[i].ended&&m[i].currentTime>0)return 'busy';}
+            return 'idle';
+        }catch(e){return 'busy';}})();""".trimIndent()
+        try {
+            webView.evaluateJavascript(js) { value -> callback((value ?: "").replace("\"", "") == "idle") }
+        } catch (_: Exception) { callback(false) }
+    }
+
+    private fun nudgePageToReconnectAndRefetch() {
+        try {
+            webView.evaluateJavascript(
+                "(function(){try{" +
+                "try{Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return 'visible'}});}catch(e){}" +
+                "try{Object.defineProperty(document,'hidden',{configurable:true,get:function(){return false}});}catch(e){}" +
+                "try{document.dispatchEvent(new Event('visibilitychange'));}catch(e){}" +
+                "try{window.dispatchEvent(new Event('focus'));}catch(e){}" +
+                "try{window.dispatchEvent(new Event('online'));}catch(e){}" +
+                "try{window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:false}));}catch(e){try{window.dispatchEvent(new Event('pageshow'));}catch(_){}}" +
+                "try{window.dispatchEvent(new Event('app-resumed'));}catch(e){}" +
+                "try{window.dispatchEvent(new CustomEvent('appduct:revalidate',{detail:{source:'appduct-native'}}));}catch(e){}" +
+                "try{window.dispatchEvent(new CustomEvent('appduct:upload-complete',{detail:{source:'appduct-native'}}));}catch(e){}" +
+                "}catch(e){}})();",
+                null
+            )
+        } catch (_: Exception) {}
     }
 
     private fun reloadFromSyncSignal() {
@@ -1758,6 +1822,14 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /** Native fallback used by the completion watcher; independent of pull-to-refresh. */
+        @android.webkit.JavascriptInterface
+        fun requestCompletionRevalidation(reason: String?) {
+            runOnUiThread {
+                try { this@MainActivity.requestCompletionRevalidation(reason) } catch (_: Exception) {}
+            }
+        }
+
         /**
          * Save a base64-encoded blob (e.g. from a blob: download or a generated PDF) into
          * the public Downloads folder. Called from the JS shim when WebView cannot handle
@@ -1989,7 +2061,8 @@ class MainActivity : AppCompatActivity() {
               }catch(e){return false;}}
               function queueDocumentReload(){
                 if(reloadQueued||!inDocumentWorkflow())return;reloadQueued=true;
-                setTimeout(function(){try{if(!isBusy())location.reload();else reloadQueued=false;}catch(e){reloadQueued=false;}},1400);
+                try{if(window.AndroidShareBridge&&window.AndroidShareBridge.requestCompletionRevalidation){window.AndroidShareBridge.requestCompletionRevalidation('success-toast');return;}}catch(e){}
+                setTimeout(function(){try{if(!isBusy())location.reload();else reloadQueued=false;}catch(e){reloadQueued=false;}},1800);
               }
               function looksLikeCompletion(text){try{
                 text=String(text||'').replace(/\s+/g,' ').trim();
