@@ -814,43 +814,97 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                if (fullscreenView != null || view == null) {
+                    try { callback?.onCustomViewHidden() } catch (_: Exception) {}
+                    return
+                }
                 fullscreenView = view
                 fullscreenCallback = callback
-                fullscreenContainer.addView(view)
-                fullscreenContainer.visibility = View.VISIBLE
-                webView?.visibility = View.GONE
+                preFullscreenOrientation = requestedOrientation
+                webView.visibility = View.GONE
                 swipeRefresh.visibility = View.GONE
                 bottomNav.visibility = View.GONE
-                // Save the current orientation lock so we can restore it when the user exits
-                // fullscreen. During fullscreen video/media playback we force landscape via
-                // SCREEN_ORIENTATION_SENSOR_LANDSCAPE — this rotates to landscape regardless of
-                // the user's system-level auto-rotate setting (which SENSOR would otherwise
-                // respect), and still allows flipping between the two landscape orientations
-                // based on how the device is held. Matches YouTube / native player UX.
-                preFullscreenOrientation = requestedOrientation
-                requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                window.decorView.systemUiVisibility = (
-                    View.SYSTEM_UI_FLAG_FULLSCREEN
-                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                    or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+
+                // Prepare a black physical-window surface before rotating. Attaching to
+                // DecorView avoids the inset-aware AppCompat content root that can expose
+                // its white background as a frame on Android 15/16.
+                window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.BLACK))
+                androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+                window.addFlags(
+                    android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN or
+                        android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                 )
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                    window.attributes = window.attributes.apply {
+                        layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    }
+                }
+                window.statusBarColor = android.graphics.Color.TRANSPARENT
+                window.navigationBarColor = android.graphics.Color.TRANSPARENT
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    window.isStatusBarContrastEnforced = false
+                    window.isNavigationBarContrastEnforced = false
+                }
+                (view.parent as? android.view.ViewGroup)?.removeView(view)
+                view.setBackgroundColor(android.graphics.Color.BLACK)
+                view.setPadding(0, 0, 0, 0)
+                (window.decorView as android.view.ViewGroup).addView(
+                    view,
+                    android.widget.FrameLayout.LayoutParams(
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+                    ).also { it.gravity = android.view.Gravity.FILL }
+                )
+                view.bringToFront()
+                androidx.core.view.WindowInsetsControllerCompat(window, view).apply {
+                    isAppearanceLightStatusBars = false
+                    isAppearanceLightNavigationBars = false
+                    systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                }
+                @Suppress("DEPRECATION")
+                window.decorView.systemUiVisibility = (
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                        View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                )
+                view.post {
+                    if (fullscreenView != null) {
+                        androidx.core.view.WindowInsetsControllerCompat(window, view)
+                            .hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                    }
+                }
+                // Rotate only after the black edge-to-edge video surface is attached.
+                requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             }
             override fun onHideCustomView() {
+                val activeView = fullscreenView
+                try { (activeView?.parent as? android.view.ViewGroup)?.removeView(activeView) } catch (_: Exception) {}
                 fullscreenContainer.removeAllViews()
                 fullscreenContainer.visibility = View.GONE
                 webView.visibility = View.VISIBLE
                 swipeRefresh.visibility = View.VISIBLE
                 if (%%BOTTOM_NAV%%) bottomNav.visibility = View.VISIBLE
-                fullscreenCallback?.onCustomViewHidden()
+                val cb = fullscreenCallback
                 fullscreenView = null
                 fullscreenCallback = null
-                // Restore the pre-fullscreen orientation lock (e.g. portrait) so the app UI
-                // returns to its configured orientation after the video closes.
+                try { cb?.onCustomViewHidden() } catch (_: Exception) {}
                 requestedOrientation = preFullscreenOrientation
-                
+                window.clearFlags(
+                    android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN or
+                        android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                )
+                androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, true)
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                    window.attributes = window.attributes.apply {
+                        layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+                    }
+                }
+                window.statusBarColor = android.graphics.Color.BLACK
+                window.navigationBarColor = android.graphics.Color.BLACK
+                androidx.core.view.WindowInsetsControllerCompat(window, window.decorView)
+                    .show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                @Suppress("DEPRECATION")
                 window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
             }
 
