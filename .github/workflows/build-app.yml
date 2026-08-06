@@ -1,4 +1,5 @@
 name: Build Android App
+run-name: Build ${{ inputs.project_name }} (${{ inputs.build_id }})
 
 on:
   workflow_dispatch:
@@ -101,6 +102,9 @@ jobs:
     # Keep time available for the terminal failure callback after Gradle stops.
     timeout-minutes: 35
 
+    concurrency:
+      group: appduct-android-${{ inputs.build_id }}
+      cancel-in-progress: true
     steps:
       - name: Checkout template
         uses: actions/checkout@v4
