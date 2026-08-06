@@ -98,7 +98,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Keep time available for the terminal failure callback after Gradle stops.
+    timeout-minutes: 35
 
     steps:
       - name: Checkout template
@@ -416,7 +417,14 @@ jobs:
       - name: Build APK & AAB
         working-directory: build-output
         run: |
-          ./gradlew assembleRelease bundleRelease --no-daemon 2>&1 | tee build.log
+          set -o pipefail
+          timeout --signal=TERM --kill-after=60s 25m \
+            ./gradlew assembleRelease bundleRelease --no-daemon 2>&1 | tee build.log
+          result=${PIPESTATUS[0]}
+          if [ "$result" -eq 124 ]; then
+            echo "Build stopped after the 25-minute safety limit." | tee -a build.log
+          fi
+          exit "$result"
           
       - name: Upload artifacts to Supabase Storage
         id: upload
