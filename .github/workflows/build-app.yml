@@ -115,16 +115,6 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Cache Gradle caches & wrapper
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            gradle-${{ runner.os }}-
-
       - name: Cache Android SDK
         uses: actions/cache@v4
         with:
@@ -141,6 +131,8 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
       - name: Notify build started
         env:
@@ -162,7 +154,7 @@ jobs:
           SYNC_CONFIG_JSON: ${{ inputs.sync_config_json }}
         run: |
           mkdir -p build-output
-          sudo apt-get install -y jq > /dev/null 2>&1 || true
+          command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
 
           # Parse consolidated JSON blobs (GitHub workflow_dispatch has a 25-input limit)
           EF="${EXTRA_FEATURES_JSON:-{}}"
@@ -311,7 +303,7 @@ jobs:
           DRAWABLE_DIR="build-output/app/src/main/res/drawable"
           mkdir -p "$DRAWABLE_DIR"
           
-          sudo apt-get install -y imagemagick > /dev/null 2>&1 || true
+          command -v convert >/dev/null 2>&1 || sudo apt-get install -y imagemagick > /dev/null 2>&1 || true
           
           if [ -n "$SPLASH_URL" ] && [ "$SPLASH_URL" != "" ]; then
             echo "Downloading splash image from $SPLASH_URL"
@@ -343,7 +335,7 @@ jobs:
           ASSETS_DIR="build-output/app/src/main/assets"
           DRAWABLE_DIR="build-output/app/src/main/res/drawable"
           mkdir -p "$ASSETS_DIR" "$DRAWABLE_DIR"
-          sudo apt-get install -y jq imagemagick > /dev/null 2>&1 || true
+          command -v jq >/dev/null 2>&1 && command -v convert >/dev/null 2>&1 || sudo apt-get install -y jq imagemagick > /dev/null 2>&1 || true
 
           EF="${EXTRA_FEATURES_JSON:-{}}"
           MULTI_LINKS_JSON=$(echo "$EF" | jq -c '.multi_links // []' 2>/dev/null || echo '[]')
@@ -377,7 +369,7 @@ jobs:
           SYNC_CONFIG_JSON: ${{ inputs.sync_config_json }}
         run: |
           set -e
-          sudo apt-get install -y jq > /dev/null 2>&1 || true
+          command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
           SC="${SIGNING_CONFIG_JSON:-}"
           if [ -z "$SC" ] || [ "$SC" = "{}" ]; then
             SC=$(printf '%s' "${SYNC_CONFIG_JSON:-{}}" | jq -c '.signing_config // {}' 2>/dev/null || echo '{}')
@@ -423,7 +415,7 @@ jobs:
         run: |
           set -o pipefail
           timeout --signal=TERM --kill-after=60s 25m \
-            ./gradlew assembleRelease bundleRelease --no-daemon 2>&1 | tee build.log
+            ./gradlew assembleRelease bundleRelease --no-daemon --parallel --build-cache --configure-on-demand --max-workers=4 2>&1 | tee build.log
           result=${PIPESTATUS[0]}
           if [ "$result" -eq 124 ]; then
             echo "Build stopped after the 25-minute safety limit." | tee -a build.log
@@ -538,12 +530,3 @@ jobs:
             "Build failed. Last 50 lines: ${LOGS}" \
             "$BUILD_WEBHOOK_SECRET" || true
 
-      - name: Upload build artifacts
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-build-${{ inputs.build_id }}
-          path: |
-            build-output/app/build/outputs/apk/release/*.apk
-            build-output/app/build/outputs/bundle/release/*.aab
-          retention-days: 30
