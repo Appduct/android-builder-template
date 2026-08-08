@@ -147,6 +147,11 @@ class MainActivity : AppCompatActivity() {
     private val syncSupabaseUrl = "%%SUPABASE_URL%%"
     private val syncAnonKey = "%%SUPABASE_ANON_KEY%%"
     private val syncPollIntervalMs: Long = 5000L
+    // ---- Release update notifier -------------------------------------------------
+    // Installed apps learn about a newly published store release through the backend
+    // `app_releases` table and raise a local "Update available" notification.
+    private var lastReleaseCheckAt: Long = 0L
+    private val releaseCheckIntervalMs: Long = 3 * 60 * 60 * 1000L
     private var lastSignalAt: String = ""
     private var syncSignalInitialized: Boolean = false
     private var lastSyncReloadAt: Long = 0L
@@ -167,6 +172,7 @@ class MainActivity : AppCompatActivity() {
     private val syncRunnable = object : Runnable {
         override fun run() {
             checkSyncSignal()
+            checkForBackendRelease()
             syncHandler.postDelayed(this, syncPollIntervalMs)
         }
     }
@@ -294,6 +300,7 @@ class MainActivity : AppCompatActivity() {
         setupWebView(offlineModeEnabled)
         setupSwipeRefresh(pullToRefreshEnabled)
         setupBottomNav(bottomNavEnabled)
+        configureForTelevisionIfNeeded()
         // NOTE: We intentionally do NOT pre-request READ_MEDIA_IMAGES/VIDEO here.
         // The WebView file chooser uses Storage Access Framework (ACTION_GET_CONTENT),
         // which does not require those runtime permissions. Pre-requesting them on
@@ -1230,6 +1237,73 @@ class MainActivity : AppCompatActivity() {
     }
 
 
+    // ---- Android TV / leanback support -------------------------------------------
+    /** True on Android TV, Google TV, or any device driven without a touchscreen. */
+    private val isTelevision: Boolean by lazy {
+        try {
+            val ui = getSystemService(android.content.Context.UI_MODE_SERVICE) as android.app.UiModeManager
+            ui.currentModeType == android.content.res.Configuration.UI_MODE_TYPE_TELEVISION ||
+                packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_LEANBACK) ||
+                !packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_TOUCHSCREEN)
+        } catch (_: Throwable) { false }
+    }
+
+    private fun configureForTelevisionIfNeeded() {
+        if (!isTelevision) return
+        try {
+            swipeRefresh.isEnabled = false
+            webView.isFocusable = true
+            webView.isFocusableInTouchMode = true
+            webView.requestFocus()
+            webView.settings.builtInZoomControls = false
+            webView.settings.displayZoomControls = false
+            webView.settings.useWideViewPort = true
+            webView.settings.loadWithOverviewMode = true
+            for (i in 0 until bottomNav.childCount) {
+                bottomNav.getChildAt(i).isFocusable = true
+                bottomNav.getChildAt(i).isFocusableInTouchMode = true
+            }
+            var attempts = 0
+            val tvHandler = Handler(Looper.getMainLooper())
+            val injector = object : Runnable {
+                override fun run() {
+                    injectTelevisionFocusStyles()
+                    attempts++
+                    if (attempts < 6) tvHandler.postDelayed(this, 2000)
+                }
+            }
+            tvHandler.postDelayed(injector, 1500)
+        } catch (_: Throwable) {}
+    }
+
+    private fun injectTelevisionFocusStyles() {
+        if (!isTelevision) return
+        try {
+            webView.evaluateJavascript(
+                "(function(){try{document.documentElement.setAttribute('data-appduct-tv','1');" +
+                "if(document.getElementById('appduct-tv-focus'))return;" +
+                "var s=document.createElement('style');s.id='appduct-tv-focus';" +
+                "s.textContent='*:focus{outline:3px solid #22c55e !important;outline-offset:2px !important;}" +
+                "a:focus,button:focus,[tabindex]:focus{box-shadow:0 0 0 4px rgba(34,197,94,.35) !important;}';" +
+                "(document.head||document.documentElement).appendChild(s);}catch(e){}})();",
+                null,
+            )
+        } catch (_: Throwable) {}
+    }
+
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
+        if (isTelevision) {
+            when (keyCode) {
+                android.view.KeyEvent.KEYCODE_MEDIA_REWIND ->
+                    if (webView.canGoBack()) { webView.goBack(); return true }
+                android.view.KeyEvent.KEYCODE_MEDIA_FAST_FORWARD ->
+                    if (webView.canGoForward()) { webView.goForward(); return true }
+                android.view.KeyEvent.KEYCODE_MENU -> { webView.reload(); return true }
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     private fun setupSwipeRefresh(enabled: Boolean) {
         swipeRefresh.isEnabled = enabled
         if (!enabled) return
@@ -1603,6 +1677,127 @@ class MainActivity : AppCompatActivity() {
         syncHandler.removeCallbacks(syncRunnable)
     }
 
+    /** Version code of the currently installed build. */
+    private fun installedVersionCode(): Long {
+        return try {
+            val pi = packageManager.getPackageInfo(packageName, 0)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) pi.longVersionCode
+            else @Suppress("DEPRECATION") pi.versionCode.toLong()
+        } catch (_: Throwable) { 0L }
+    }
+
+    private fun ensureNotificationPermission() {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 5150)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    /**
+     * Ask the backend whether a newer release has been published for this app. When the
+     * announced version code is higher than the installed one, notify the user once.
+     */
+    private fun checkForBackendRelease(force: Boolean = false) {
+        if (!syncConfigured()) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastReleaseCheckAt < releaseCheckIntervalMs) return
+        lastReleaseCheckAt = now
+        Thread {
+            try {
+                val urlStr = syncSupabaseUrl.trimEnd('/') +
+                    "/rest/v1/app_releases?project_id=eq." + syncProjectId +
+                    "&select=version_code,version_name,release_notes,store_url" +
+                    "&order=version_code.desc&limit=1"
+                val conn = URL(urlStr).openConnection() as HttpURLConnection
+                conn.connectTimeout = 6000
+                conn.readTimeout = 6000
+                conn.setRequestProperty("apikey", syncAnonKey)
+                conn.setRequestProperty("Authorization", "Bearer " + syncAnonKey)
+                conn.setRequestProperty("Accept", "application/json")
+                if (conn.responseCode in 200..299) {
+                    val body = conn.inputStream.bufferedReader().readText()
+                    val code = Regex("\"version_code\"\\s*:\\s*(\\d+)").find(body)
+                        ?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                    val name = Regex("\"version_name\"\\s*:\\s*\"([^\"]*)\"").find(body)?.groupValues?.get(1) ?: ""
+                    val notes = Regex("\"release_notes\"\\s*:\\s*\"([^\"]*)\"").find(body)?.groupValues?.get(1) ?: ""
+                    val store = Regex("\"store_url\"\\s*:\\s*\"([^\"]*)\"").find(body)?.groupValues?.get(1) ?: ""
+                    if (code > installedVersionCode()) {
+                        runOnUiThread { announceUpdateAvailable(code, name, notes, store) }
+                    }
+                }
+                conn.disconnect()
+            } catch (_: Exception) {}
+        }.start()
+    }
+
+    private fun storeIntentForUpdate(storeUrl: String): android.content.Intent {
+        val target = if (storeUrl.isNotEmpty()) storeUrl else "market://details?id=$packageName"
+        return android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.parse(target)).apply {
+            addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+    }
+
+    /** Post a system notification (once per version) and, if visible, an in-app prompt. */
+    private fun announceUpdateAvailable(code: Long, name: String, notes: String, storeUrl: String) {
+        val appName = try { applicationInfo.loadLabel(packageManager).toString() } catch (_: Throwable) { "App" }
+        val text = if (notes.isNotEmpty()) notes
+            else "A new version${if (name.isNotEmpty()) " (v$name)" else ""} of $appName is available."
+        val prefs = getSharedPreferences("appduct_release", MODE_PRIVATE)
+        val notifiedKey = "notified_$code"
+        if (!prefs.getBoolean(notifiedKey, false)) {
+            prefs.edit().putBoolean(notifiedKey, true).apply()
+            try {
+                ensureNotificationPermission()
+                val mgr = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+                    mgr.getNotificationChannel("appduct_app_updates") == null
+                ) {
+                    mgr.createNotificationChannel(
+                        android.app.NotificationChannel(
+                            "appduct_app_updates",
+                            "App updates",
+                            android.app.NotificationManager.IMPORTANCE_DEFAULT
+                        ).apply { description = "Tells you when a new version of the app is available." }
+                    )
+                }
+                val flags = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M)
+                    android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                else android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                val pi = android.app.PendingIntent.getActivity(
+                    this, code.toInt(), storeIntentForUpdate(storeUrl), flags
+                )
+                val notif = androidx.core.app.NotificationCompat.Builder(this, "appduct_app_updates")
+                    .setSmallIcon(applicationInfo.icon)
+                    .setContentTitle("Update available")
+                    .setContentText(text)
+                    .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(text))
+                    .setAutoCancel(true)
+                    .setContentIntent(pi)
+                    .build()
+                mgr.notify(7241, notif)
+            } catch (_: Throwable) {}
+        }
+        val promptedKey = "prompted_$code"
+        if (prefs.getBoolean(promptedKey, false)) return
+        try {
+            if (isFinishing || isDestroyed) return
+            prefs.edit().putBoolean(promptedKey, true).apply()
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("Update available")
+                .setMessage(text)
+                .setPositiveButton("Update") { _, _ ->
+                    try { startActivity(storeIntentForUpdate(storeUrl)) } catch (_: Throwable) {}
+                }
+                .setNegativeButton("Later", null)
+                .setCancelable(true)
+                .show()
+        } catch (_: Throwable) {}
+    }
+
     private fun nextSyncRef(): String = (syncRefCounter++).toString()
 
     private fun syncConfigured(): Boolean =
@@ -1632,6 +1827,7 @@ class MainActivity : AppCompatActivity() {
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     if (text.contains("\"event\":\"postgres_changes\"") && text.contains(syncProjectId)) {
                         reloadFromSyncSignal()
+                        checkForBackendRelease(true)
                     }
                 }
 
@@ -1686,6 +1882,7 @@ class MainActivity : AppCompatActivity() {
                         // Reload on any new signal we observe after the first poll.
                         // (First poll just establishes a baseline so we don't reload on launch.)
                         if (wasInitialized) reloadFromSyncSignal()
+                        if (wasInitialized) checkForBackendRelease(true)
                     } else if (ts.isEmpty()) {
                         // No signals yet — still mark baseline so the first ever signal triggers a reload.
                         syncSignalInitialized = true
