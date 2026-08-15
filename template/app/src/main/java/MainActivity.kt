@@ -105,8 +105,12 @@ class MainActivity : AppCompatActivity() {
     private val expiryTimestamp: Long = %%EXPIRY_TIMESTAMP%%L
     private var splashDismissed = false
     private var fullscreenView: View? = null
+    private var fullscreenRoot: FrameLayout? = null
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
     private var preFullscreenOrientation: Int = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    private var preFullscreenStatusBarColor: Int = Color.TRANSPARENT
+    private var preFullscreenNavigationBarColor: Int = Color.TRANSPARENT
+    private var preFullscreenWindowBackground: android.graphics.drawable.Drawable? = null
     private var landingBaselineIndex = -1
 
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
@@ -131,6 +135,10 @@ class MainActivity : AppCompatActivity() {
     private var prewarmDone = false
     private var prewarmWebView: WebView? = null
     private var triedCacheFallback = false
+    // Offline Mode feature flag, kept as a field so every load path (initial load,
+    // refresh, sync reload, error fallback, connectivity changes) can honour it.
+    private var offlineModeEnabled = false
+
 
     // Track when the app was last paused. We refresh on resume after even a short absence
     // so users always see the latest content when returning to the app — without waiting
@@ -183,7 +191,7 @@ class MainActivity : AppCompatActivity() {
 
         // Tablet fix: on devices with smallestScreenWidthDp >= 600 (7"+ tablets, Chromebooks,
         // foldables in outer state, Android TV), never enforce the manifest's portrait lock.
-        // On Android 14/15, targetSdk 35 + a hard portrait lock on a landscape-primary tablet
+        // On Android 14/15/16, targetSdk 36 + a hard portrait lock on a landscape-primary tablet
         // causes the activity to be letterboxed and the WebView to be laid out at 0 height
         // before the first paint, which looks like a "blank page". Releasing the lock lets
         // the tablet render the WebView at its natural size.
@@ -295,9 +303,10 @@ class MainActivity : AppCompatActivity() {
         // Feature flags
         val pullToRefreshEnabled = %%PULL_TO_REFRESH%%
         val bottomNavEnabled = %%BOTTOM_NAV%%
-        val offlineModeEnabled = %%OFFLINE_MODE%%
+        offlineModeEnabled = %%OFFLINE_MODE%%
 
         setupWebView(offlineModeEnabled)
+
         setupSwipeRefresh(pullToRefreshEnabled)
         setupBottomNav(bottomNavEnabled)
         configureForTelevisionIfNeeded()
@@ -322,7 +331,7 @@ class MainActivity : AppCompatActivity() {
             if (isNetworkAvailable()) {
                 loadUrl()
             } else if (offlineModeEnabled) {
-                // Try cached version
+                // Serve the previously cached copy of the site.
                 webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
                 triedCacheFallback = true
                 loadUrl()
@@ -331,6 +340,9 @@ class MainActivity : AppCompatActivity() {
                 showError("Please check your internet connection and try again.")
             }
         }
+
+        if (offlineModeEnabled) registerOfflineConnectivityWatcher()
+
 
         syncHandler.removeCallbacks(syncRunnable)
         syncHandler.post(syncRunnable)
@@ -488,6 +500,152 @@ class MainActivity : AppCompatActivity() {
         Handler(Looper.getMainLooper()).postDelayed({ splashView.visibility = View.GONE }, 420)
     }
 
+    /**
+     * Single source of truth for leaving fullscreen video. Detaches the fullscreen holder,
+     * makes the page content visible again, restores orientation and the normal (inset-aware)
+     * window layout. Safe to call multiple times and safe to call when we were never in
+     * fullscreen — this is what prevents the app from getting stuck on a blank/hidden page
+     * when a player exits fullscreen without a matching onHideCustomView.
+     */
+    private fun exitFullscreenAndRestoreContent() {
+        try {
+            fullscreenContainer.removeAllViews()
+            fullscreenContainer.visibility = View.GONE
+        } catch (_: Exception) {}
+        fullscreenRoot?.let { fr ->
+            try {
+                fr.removeAllViews()
+                fr.visibility = View.GONE
+                (fr.parent as? android.view.ViewGroup)?.removeView(fr)
+            } catch (_: Exception) {}
+        }
+        val cb = fullscreenCallback
+        fullscreenView = null
+        fullscreenCallback = null
+        try { cb?.onCustomViewHidden() } catch (_: Exception) {}
+
+        restoreContentVisibility()
+
+        // Restore the pre-fullscreen orientation lock (e.g. portrait).
+        try { requestedOrientation = preFullscreenOrientation } catch (_: Exception) {}
+
+        // Restore normal (non edge-to-edge) window layout so app chrome sits below the
+        // status bar again after leaving fullscreen.
+        try {
+            window.clearFlags(
+                android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN or
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            )
+            androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, true)
+            (fullscreenContainer.parent as? View)?.fitsSystemWindows = true
+            window.statusBarColor = preFullscreenStatusBarColor
+            window.navigationBarColor = preFullscreenNavigationBarColor
+            window.setBackgroundDrawable(
+                preFullscreenWindowBackground
+                    ?: android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)
+            )
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                window.attributes = window.attributes.apply {
+                    layoutInDisplayCutoutMode =
+                        android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+                }
+            }
+            androidx.core.view.WindowInsetsControllerCompat(window, window.decorView)
+                .show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            androidx.core.view.ViewCompat.requestApplyInsets(window.decorView)
+        } catch (_: Throwable) {}
+
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+    }
+
+    /**
+     * Re-applies immersive mode after rotation, focus changes, or a transient system-bar
+     * reveal. The custom video is attached to DecorView itself so no AppCompat/content-root
+     * background or inset frame can be drawn above or around it.
+     */
+    private fun applyFullscreenWindowMode() {
+        val holder = fullscreenRoot ?: return
+        try {
+            androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+            window.addFlags(
+                android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN or
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            )
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                window.attributes = window.attributes.apply {
+                    layoutInDisplayCutoutMode =
+                        android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
+            window.statusBarColor = Color.TRANSPARENT
+            window.navigationBarColor = Color.TRANSPARENT
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                window.isStatusBarContrastEnforced = false
+                window.isNavigationBarContrastEnforced = false
+            }
+            androidx.core.view.WindowInsetsControllerCompat(window, holder).apply {
+                isAppearanceLightStatusBars = false
+                isAppearanceLightNavigationBars = false
+                systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat
+                    .BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            }
+            androidx.core.view.ViewCompat.requestApplyInsets(holder)
+        } catch (_: Throwable) {}
+
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        )
+    }
+
+    /** Re-show the page (or native landing) after fullscreen, without fighting landing mode. */
+    private fun restoreContentVisibility() {
+        try {
+            if (landingEnabled && landingContainer?.visibility == View.VISIBLE) {
+                // Native landing page is the current screen — leave it on top.
+                swipeRefresh.visibility = View.GONE
+            } else {
+                swipeRefresh.visibility = View.VISIBLE
+                if (splashDismissed) webView.visibility = View.VISIBLE
+            }
+            if (%%BOTTOM_NAV%%) bottomNav.visibility = View.VISIBLE
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Defensive guard: if we are not in fullscreen but the page container was left hidden
+     * (orphaned fullscreen state, activity recreated mid-playback, player crash), bring the
+     * content back. Called from lifecycle/page callbacks so the app can never stay blank.
+     */
+    private fun ensureContentVisible() {
+        if (fullscreenView != null) return
+        try {
+            val stuckHolderAttached = fullscreenRoot?.parent != null
+            val contentHidden = swipeRefresh.visibility != View.VISIBLE &&
+                !(landingEnabled && landingContainer?.visibility == View.VISIBLE)
+            if (stuckHolderAttached || contentHidden || fullscreenContainer.visibility == View.VISIBLE) {
+                exitFullscreenAndRestoreContent()
+            }
+        } catch (_: Exception) {}
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && fullscreenView != null) {
+            // Rotation and transient system UI can reset immersive flags after the video
+            // view was attached. Re-hide bars only while a custom video view is active.
+            applyFullscreenWindowMode()
+        }
+    }
+
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView(offlineMode: Boolean) {
         // Enable cookies (1st-party + 3rd-party) and persist them across sessions
@@ -495,14 +653,24 @@ class MainActivity : AppCompatActivity() {
             val cookieManager = CookieManager.getInstance()
             cookieManager.setAcceptCookie(true)
             cookieManager.setAcceptThirdPartyCookies(webView, true)
-            // Real-time compliance: clear only the HTTP cache (not cookies/storage) so logins persist
-            webView.clearCache(true)
-            // Disable any service worker caching from the wrapped website so content stays live
+            // Real-time compliance: clear only the HTTP cache (not cookies/storage) so logins persist.
+            // We do this ONCE per launch — after this, we trust the server's Cache-Control headers
+            // so background polling / status-check endpoints (which already send `no-store`) revalidate
+            // properly via ETag / If-Modified-Since. Forcing LOAD_NO_CACHE app-wide was breaking those
+            // conditional requests and causing sites like Carbby to silently drop upload-status updates.
+            // IMPORTANT: when Offline Mode is enabled we must NEVER wipe the cache at startup —
+            // doing so destroyed exactly the content offline access depends on.
+            if (!offlineMode) webView.clearCache(true)
+
+            // Let the service worker function normally — many real-time SPAs route background
+            // status polls, push handlers, and offline queues through their SW. Overriding the
+            // ServiceWorkerClient here (even with a null-returning shouldInterceptRequest) was
+            // blocking those fetches and killing the "documents uploaded → tick → submit → success"
+            // flow. We keep SW cache at LOAD_DEFAULT so the SW's own Cache API works as designed.
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
-                ServiceWorkerController.getInstance().serviceWorkerWebSettings.cacheMode = WebSettings.LOAD_NO_CACHE
-                ServiceWorkerController.getInstance().setServiceWorkerClient(object : ServiceWorkerClient() {
-                    override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? = null
-                })
+                try {
+                    ServiceWorkerController.getInstance().serviceWorkerWebSettings.cacheMode = WebSettings.LOAD_DEFAULT
+                } catch (_: Exception) {}
             }
         } catch (_: Exception) {}
 
@@ -511,8 +679,10 @@ class MainActivity : AppCompatActivity() {
             domStorageEnabled = true
             databaseEnabled = true
             allowFileAccess = true
-            // Real-time mode: never serve from cache when online; offline mode falls back to cache
-            cacheMode = if (offlineMode) WebSettings.LOAD_CACHE_ELSE_NETWORK else WebSettings.LOAD_NO_CACHE
+            // Offline Mode: stay browser-equivalent while online (so the HTTP cache fills with
+            // fresh, revalidated content) and fall back to cache-only when the network is gone.
+            cacheMode = if (offlineMode && !isNetworkAvailable()) WebSettings.LOAD_CACHE_ONLY else WebSettings.LOAD_DEFAULT
+
             setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
@@ -523,7 +693,30 @@ class MainActivity : AppCompatActivity() {
             // Support target=_blank / window.open so we can route share-link popups to the OS
             setSupportMultipleWindows(true)
             javaScriptCanOpenWindowsAutomatically = true
+            // Compatibility fix — many sites (payment flows, upload/status pollers, SPA
+            // routers that redirect after POST) detect Android WebView by the "; wv)"
+            // marker in the default UA and disable background fetch / XHR / redirect
+            // handling. Strip the "wv" flag so the site treats the app like Chrome and
+            // real-time background flows (polling for uploaded documents, ticking
+            // checkboxes, redirecting to a success page after final submit) behave
+            // exactly as they do in the browser.
+            try {
+                val original = userAgentString ?: ""
+                val cleaned = original
+                    .replace(Regex("\\s*;\\s*wv"), "")
+                    .replace(Regex("Version/[0-9.]+\\s*"), "")
+                if (cleaned.isNotBlank() && cleaned != original) {
+                    userAgentString = cleaned
+                }
+            } catch (_: Exception) {}
         }
+        // Enable WebView remote debugging on debug builds so background XHR / fetch
+        // failures can be inspected with chrome://inspect. Safe no-op in release.
+        try {
+            if ((applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+                WebView.setWebContentsDebuggingEnabled(true)
+            }
+        } catch (_: Exception) {}
         // Expose a native share bridge so navigator.share() opens the OS share sheet
         try { webView.addJavascriptInterface(NativeShareBridge(), "AndroidShareBridge") } catch (_: Exception) {}
         // Expose biometric auth bridge so the wrapped login page can trigger the OS
@@ -603,6 +796,7 @@ class MainActivity : AppCompatActivity() {
                 injectNativeShareShim(view)
                 injectBiometricLoginShim(view)
                 injectRealtimeCompletionShim(view)
+                injectRealtimeCompletionShim(view)
             }
             override fun onPageFinished(view: WebView?, url: String?) {
                 progressBar.visibility = View.GONE
@@ -610,9 +804,13 @@ class MainActivity : AppCompatActivity() {
                 injectNativeShareShim(view)
                 injectBiometricLoginShim(view)
                 injectRealtimeCompletionShim(view)
+                injectRealtimeCompletionShim(view)
                 try { CookieManager.getInstance().flush() } catch (_: Exception) {}
                 resetLandingRootHistoryIfNeeded(url)
                 dismissSplash()
+                // Never leave the page container hidden by an orphaned fullscreen session.
+                ensureContentVisible()
+
                 // Pre-warm offline cache once per launch when Offline Mode is on and we're online
                 if (offlineMode && !prewarmDone && isNetworkAvailable()) {
                     prewarmDone = true
@@ -914,6 +1112,9 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
             }
+
+
+
 
             // Return a 1x1 transparent bitmap so WebView does NOT overlay its default gray
             // "play triangle on gray gradient" placeholder on top of <video> elements. This
@@ -1248,10 +1449,13 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Throwable) { false }
     }
 
+    /** Adapt the wrapper for 10-foot / D-pad usage when running on a TV. */
     private fun configureForTelevisionIfNeeded() {
         if (!isTelevision) return
         try {
+            // No touchscreen: pull-to-refresh would swallow D-pad scrolling.
             swipeRefresh.isEnabled = false
+
             webView.isFocusable = true
             webView.isFocusableInTouchMode = true
             webView.requestFocus()
@@ -1259,20 +1463,24 @@ class MainActivity : AppCompatActivity() {
             webView.settings.displayZoomControls = false
             webView.settings.useWideViewPort = true
             webView.settings.loadWithOverviewMode = true
+
+            // Make the bottom nav buttons reachable with the remote.
             for (i in 0 until bottomNav.childCount) {
                 bottomNav.getChildAt(i).isFocusable = true
                 bottomNav.getChildAt(i).isFocusableInTouchMode = true
             }
+
+            // Focus rings are essential on TV — inject them a few times while the SPA boots.
             var attempts = 0
-            val tvHandler = Handler(Looper.getMainLooper())
+            val handler = Handler(Looper.getMainLooper())
             val injector = object : Runnable {
                 override fun run() {
                     injectTelevisionFocusStyles()
                     attempts++
-                    if (attempts < 6) tvHandler.postDelayed(this, 2000)
+                    if (attempts < 6) handler.postDelayed(this, 2000)
                 }
             }
-            tvHandler.postDelayed(injector, 1500)
+            handler.postDelayed(injector, 1500)
         } catch (_: Throwable) {}
     }
 
@@ -1291,6 +1499,7 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Throwable) {}
     }
 
+    /** Map remote-control transport keys onto browser navigation. */
     override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
         if (isTelevision) {
             when (keyCode) {
@@ -1308,8 +1517,18 @@ class MainActivity : AppCompatActivity() {
         swipeRefresh.isEnabled = enabled
         if (!enabled) return
         swipeRefresh.setColorSchemeColors(resources.getColor(R.color.colorPrimary, theme))
+        // Keep pull-to-refresh from hijacking upload/form/status-check screens.
+        // SwipeRefreshLayout is a native parent of the WebView; when it triggers while a
+        // site is polling for document-upload state, the forced page reload can cancel
+        // in-flight JS timers/fetches. Only allow the gesture on plain, idle pages at
+        // the top of the WebView.
+        swipeRefresh.setOnChildScrollUpCallback { _, _ ->
+            try { webView.scrollY > 0 || webView.canScrollVertically(-1) } catch (_: Exception) { true }
+        }
         swipeRefresh.setOnRefreshListener {
-            if (isNetworkAvailable()) { loadFreshWebsite() }
+            if (isNetworkAvailable()) {
+                refreshFromUserGesture()
+            }
             else { swipeRefresh.isRefreshing = false; showError("Please check your internet connection and try again.") }
         }
     }
@@ -1495,6 +1714,13 @@ class MainActivity : AppCompatActivity() {
 
 
     private fun loadUrl() {
+        if (offlineModeEnabled) {
+            // Offline Mode must let responses be cached, so we do NOT send `no-store`
+            // request headers here (they prevented the WebView from ever storing the page)
+            // and we keep the URL stable so cache lookups hit when the device goes offline.
+            webView.loadUrl(websiteUrl)
+            return
+        }
         val headers = hashMapOf(
             "Cache-Control" to "no-cache, no-store, must-revalidate",
             "Pragma" to "no-cache",
@@ -1503,13 +1729,63 @@ class MainActivity : AppCompatActivity() {
         webView.loadUrl(websiteUrl, headers)
     }
 
+    /** Keeps the WebView cache mode in sync with connectivity when Offline Mode is on. */
+    private fun applyOfflineCacheMode() {
+        if (!::webView.isInitialized) return
+        try {
+            webView.settings.cacheMode = if (offlineModeEnabled && !isNetworkAvailable()) {
+                WebSettings.LOAD_CACHE_ONLY
+            } else {
+                WebSettings.LOAD_DEFAULT
+            }
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Offline Mode: watch connectivity so the app flips to cache-only the moment the
+     * network drops, and back to live loading (with a reload of the cached page) when
+     * connectivity returns.
+     */
+    private fun registerOfflineConnectivityWatcher() {
+        try {
+            val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) {
+                    Handler(Looper.getMainLooper()).post {
+                        triedCacheFallback = false
+                        applyOfflineCacheMode()
+                        try {
+                            if (::webView.isInitialized && !isPickingFile && fullscreenView == null) {
+                                val current = webView.url
+                                if (current.isNullOrBlank() || current == "about:blank") loadUrl() else webView.reload()
+                            }
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                override fun onLost(network: android.net.Network) {
+                    Handler(Looper.getMainLooper()).post { applyOfflineCacheMode() }
+                }
+            })
+        } catch (_: Exception) {}
+    }
+
     private fun loadFreshWebsite() {
         try {
             webView.stopLoading()
-            // Browser-equivalent behavior: do not clear WebView/Service Worker cache or
-            // force LOAD_NO_CACHE for every request. That breaks realtime/status pollers
-            // in wrapped apps. Cache-bust only the top-level navigation URL.
-            webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
+            // Do not clear WebView/Service Worker cache or leave LOAD_NO_CACHE enabled here.
+            // That broke real-time document checks in apps that rely on browser-equivalent
+            // fetch/Service Worker behavior. Trust server Cache-Control headers and only
+            // cache-bust the top-level navigation URL.
+            applyOfflineCacheMode()
+            if (offlineModeEnabled) {
+                // Keep URLs stable (no app_sync param) and let ETag/Last-Modified handle
+                // freshness, otherwise every reload writes a new, unreachable cache entry.
+                webView.reload()
+                return
+            }
+
+
             val currentUrl = webView.url ?: websiteUrl
             val parsed = Uri.parse(currentUrl)
             val builder = parsed.buildUpon().clearQuery()
@@ -1530,30 +1806,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun refreshFromUserGesture() {
+        isPageSafeForPullRefresh { safe ->
+            if (!safe) {
+                swipeRefresh.isRefreshing = false
+                return@isPageSafeForPullRefresh
+            }
+            loadFreshWebsite()
+        }
+    }
 
-    /** Completion-toast refresh path; independent of the native pull-to-refresh toggle. */
+    /**
+     * Called from the WebView completion watcher when a wrapped site shows a successful
+     * save/upload toast. This must NEVER trigger a top-level reload — SPA sites (React
+     * Router, Next.js client nav, etc.) often navigate to a success/next-step route
+     * right after the toast, and a full reload would either revert to the previous URL
+     * (loadFreshWebsite reloads `webView.url`, which lags behind SPA pushState) or
+     * force the user back through a completed step. Instead we only nudge browser-style
+     * focus/visibility/online listeners so React Query / SWR / realtime clients refetch
+     * naturally. Any true "server said the data changed" reload comes through the
+     * realtime sync channel (reloadFromSyncSignal), not through completion toasts.
+     */
     private fun requestCompletionRevalidation(reason: String? = null) {
         if (!::webView.isInitialized || isPickingFile || !isNetworkAvailable()) return
         val now = System.currentTimeMillis()
-        if (completionReloadQueued || now - lastCompletionReloadRequestAt < 2500L) {
-            try { nudgePageToReconnectAndRefetch() } catch (_: Exception) {}
-            return
-        }
-        completionReloadQueued = true
+        // Debounce redundant nudges from stacked toasts.
+        if (now - lastCompletionReloadRequestAt < 1200L) return
         lastCompletionReloadRequestAt = now
         try { nudgePageToReconnectAndRefetch() } catch (_: Exception) {}
-        syncHandler.postDelayed({
-            completionReloadQueued = false
-            if (!::webView.isInitialized || isPickingFile || !isNetworkAvailable()) return@postDelayed
-            isPageSafeForCompletionRefresh { safe ->
-                if (!safe) return@isPageSafeForCompletionRefresh
-                val recheckAt = System.currentTimeMillis()
-                if (recheckAt - lastSyncReloadAt < 1800L) return@isPageSafeForCompletionRefresh
-                lastSyncReloadAt = recheckAt
-                try { loadFreshWebsite() } catch (_: Exception) {}
-            }
-        }, 1800L)
     }
+
 
     private fun isPageSafeForCompletionRefresh(callback: (Boolean) -> Unit) {
         if (isPickingFile || fullscreenView != null) { callback(false); return }
@@ -1567,27 +1849,34 @@ class MainActivity : AppCompatActivity() {
             return 'idle';
         }catch(e){return 'busy';}})();""".trimIndent()
         try {
-            webView.evaluateJavascript(js) { value -> callback((value ?: "").replace("\"", "") == "idle") }
+            webView.evaluateJavascript(js) { value ->
+                callback((value ?: "").replace("\"", "") == "idle")
+            }
         } catch (_: Exception) { callback(false) }
     }
 
-    private fun nudgePageToReconnectAndRefetch() {
+    private fun isPageSafeForPullRefresh(callback: (Boolean) -> Unit) {
+        if (isPickingFile || fullscreenView != null) { callback(false); return }
+        val js = """(function(){try{
+            var ae=document.activeElement;
+            if(ae){var t=(ae.tagName||'').toLowerCase();if(t==='input'||t==='textarea'||t==='select'||ae.isContentEditable)return 'busy';}
+            if(document.querySelector('input[type="file"]'))return 'busy';
+            var forms=document.querySelectorAll('form');
+            if(forms.length)return 'busy';
+            var busySel='[aria-busy="true"],[data-loading="true"],[data-pending="true"],[data-uploading="true"],.loading,.uploading,.pending,.spinner,.progress';
+            if(document.querySelector(busySel))return 'busy';
+            var m=document.querySelectorAll('video,audio');
+            for(var i=0;i<m.length;i++){if(!m[i].paused&&!m[i].ended&&m[i].currentTime>0)return 'busy';}
+            return 'idle';
+        }catch(e){return 'busy';}})();""".trimIndent()
         try {
-            webView.evaluateJavascript(
-                "(function(){try{" +
-                "try{Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return 'visible'}});}catch(e){}" +
-                "try{Object.defineProperty(document,'hidden',{configurable:true,get:function(){return false}});}catch(e){}" +
-                "try{document.dispatchEvent(new Event('visibilitychange'));}catch(e){}" +
-                "try{window.dispatchEvent(new Event('focus'));}catch(e){}" +
-                "try{window.dispatchEvent(new Event('online'));}catch(e){}" +
-                "try{window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:false}));}catch(e){try{window.dispatchEvent(new Event('pageshow'));}catch(_){}}" +
-                "try{window.dispatchEvent(new Event('app-resumed'));}catch(e){}" +
-                "try{window.dispatchEvent(new CustomEvent('appduct:revalidate',{detail:{source:'appduct-native'}}));}catch(e){}" +
-                "try{window.dispatchEvent(new CustomEvent('appduct:upload-complete',{detail:{source:'appduct-native'}}));}catch(e){}" +
-                "}catch(e){}})();",
-                null
-            )
-        } catch (_: Exception) {}
+            webView.evaluateJavascript(js) { value ->
+                val safe = (value ?: "").replace("\"", "") == "idle"
+                callback(safe)
+            }
+        } catch (_: Exception) {
+            callback(false)
+        }
     }
 
     private fun reloadFromSyncSignal() {
@@ -1609,14 +1898,53 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * After the Activity is briefly backgrounded (system file/camera picker, screen off,
+     * app switcher, incoming call), the wrapped site's realtime WebSocket / SSE /
+     * long-poll may have dropped, and any completion events fired during the reconnect
+     * gap are LOST. This shows up as: the first document upload succeeds but the
+     * status list only updates on manual pull-to-refresh, while subsequent uploads
+     * work fine because the socket is stable by then.
+     *
+     * Nudge the page in the same way returning to a Chrome tab does: mark it visible,
+     * fire visibilitychange + pageshow + focus + online, and dispatch a synthetic
+     * "app-resumed" event that sites can hook into. This causes Supabase Realtime,
+     * Firebase, Pusher, Socket.IO, SWR, React Query, and every SPA that revalidates
+     * on visibility/focus/online to reconnect and refetch immediately.
+     */
+    private fun nudgePageToReconnectAndRefetch() {
+        try {
+            webView.evaluateJavascript(
+                "(function(){try{" +
+                "try{Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return 'visible'}});}catch(e){}" +
+                "try{Object.defineProperty(document,'hidden',{configurable:true,get:function(){return false}});}catch(e){}" +
+                "try{document.dispatchEvent(new Event('visibilitychange'));}catch(e){}" +
+                "try{window.dispatchEvent(new Event('focus'));}catch(e){}" +
+                "try{window.dispatchEvent(new Event('online'));}catch(e){}" +
+                "try{window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true}));}catch(e){try{window.dispatchEvent(new Event('pageshow'));}catch(_){}}" +
+                "try{window.dispatchEvent(new Event('app-resumed'));}catch(e){}" +
+                "}catch(e){}})();",
+                null
+            )
+        } catch (_: Exception) {}
+    }
+
     override fun onResume() {
         super.onResume()
+        // Self-heal: if a previous fullscreen video session left the WebView hidden or a
+        // stale fullscreen holder attached over the app, restore the content now.
+        if (::webView.isInitialized) ensureContentVisible()
         // If we're returning from the system file/camera picker, do NOT reload the
         // page — that would discard the in-progress upload, the form state, and
         // bounce the user back to whatever route the SPA defaults to (often the
         // dashboard). The fileChooserLauncher callback fires right after this and
         // delivers the picked URIs to the WebView's <input type="file">.
         if (isPickingFile) {
+            // The picker briefly backgrounded the Activity, which can drop the site's
+            // realtime WebSocket. Nudge the page to reconnect + refetch so the very
+            // first upload's completion event isn't missed while the socket is mid-
+            // reconnect (later stages work fine because the socket is stable by then).
+            try { if (::webView.isInitialized) nudgePageToReconnectAndRefetch() } catch (_: Exception) {}
             // Restart sync polling but skip the reload-on-resume path.
             syncHandler.removeCallbacks(syncRunnable)
             syncHandler.post(syncRunnable)
@@ -1625,17 +1953,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (::webView.isInitialized && splashDismissed && isNetworkAvailable()) {
             val awayMs = if (lastPauseTime == 0L) 0L else System.currentTimeMillis() - lastPauseTime
-            try {
-                webView.evaluateJavascript(
-                    "(function(){try{" +
-                    "Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return 'visible'}});" +
-                    "Object.defineProperty(document,'hidden',{configurable:true,get:function(){return false}});" +
-                    "document.dispatchEvent(new Event('visibilitychange'));" +
-                    "window.dispatchEvent(new Event('focus'));" +
-                    "}catch(e){}})();",
-                    null
-                )
-            } catch (_: Exception) {}
+            try { nudgePageToReconnectAndRefetch() } catch (_: Exception) {}
             // Only reload after a long absence AND when nothing is in progress, so
             // short screen-off / app-switch cycles never disrupt an ongoing process.
             if (awayMs >= resumeReloadThresholdMs) {
@@ -2494,18 +2812,10 @@ class MainActivity : AppCompatActivity() {
     @Deprecated("Use onBackPressedDispatcher")
     override fun onBackPressed() {
         if (fullscreenView != null) {
-            fullscreenCallback?.onCustomViewHidden()
-            fullscreenContainer.removeAllViews()
-            fullscreenContainer.visibility = View.GONE
-            webView.visibility = View.VISIBLE
-            swipeRefresh.visibility = View.VISIBLE
-            if (%%BOTTOM_NAV%%) bottomNav.visibility = View.VISIBLE
-            fullscreenView = null
-            fullscreenCallback = null
-            requestedOrientation = preFullscreenOrientation
-            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+            exitFullscreenAndRestoreContent()
             return
         }
+
         val deviceNavEnabled = %%DEVICE_NAVIGATION%%
         if (!deviceNavEnabled) {
             try {
