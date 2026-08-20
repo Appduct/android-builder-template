@@ -101,9 +101,18 @@ class MainActivity : AppCompatActivity() {
 
 
 
-    private val websiteUrl = "%%WEBSITE_URL%%"
+    // The wrapped site URL. Baked at build time, but overridable at runtime: when the
+    // project owner changes the app URL on the dashboard, already-installed apps pick up
+    // the new URL from the backend (and cache it) without needing a rebuild.
+    private val bakedWebsiteUrl = "%%WEBSITE_URL%%"
+    private var websiteUrl = "%%WEBSITE_URL%%"
+    private var lastUrlCheckAt: Long = 0L
+    private val urlCheckIntervalMs: Long = 5 * 60 * 1000L
     private val expiryTimestamp: Long = %%EXPIRY_TIMESTAMP%%L
     private var splashDismissed = false
+    // Splash screen must stay visible for at least 3 seconds, even if the page loads faster.
+    private val minSplashDurationMs: Long = 3000L
+    private var splashShownAt: Long = 0L
     private var fullscreenView: View? = null
     private var fullscreenRoot: FrameLayout? = null
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
@@ -181,6 +190,7 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             checkSyncSignal()
             checkForBackendRelease()
+            refreshRemoteWebsiteUrl()
             syncHandler.postDelayed(this, syncPollIntervalMs)
         }
     }
@@ -296,9 +306,13 @@ class MainActivity : AppCompatActivity() {
             webView.visibility = View.VISIBLE
             splashView.visibility = View.VISIBLE
             splashDismissed = false
+            splashShownAt = android.os.SystemClock.elapsedRealtime()
             triedCacheFallback = false
             loadUrl()
         }
+
+        // Runtime app URL: prefer the URL the dashboard last published for this project.
+        websiteUrl = resolveStartupWebsiteUrl()
 
         // Feature flags
         val pullToRefreshEnabled = %%PULL_TO_REFRESH%%
@@ -320,6 +334,7 @@ class MainActivity : AppCompatActivity() {
         // login page can call window.AndroidBiometric.authenticate(...) when the user taps
         // "Sign in with biometrics". App content loads immediately as usual.
         splashView.visibility = View.VISIBLE
+        splashShownAt = android.os.SystemClock.elapsedRealtime()
         if (!landingEnabled) webView.visibility = View.INVISIBLE
 
         if (landingEnabled && setupLanding()) {
@@ -491,6 +506,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun dismissSplash() {
         if (splashDismissed) return
+        // Keep the splash on screen for the full minimum duration (3s) even when the
+        // page finishes loading sooner, so branding is always readable.
+        val shownFor = android.os.SystemClock.elapsedRealtime() - splashShownAt
+        if (splashShownAt > 0L && shownFor < minSplashDurationMs) {
+            Handler(Looper.getMainLooper()).postDelayed(
+                { dismissSplash() }, minSplashDurationMs - shownFor
+            )
+            return
+        }
         splashDismissed = true
         webView.visibility = View.VISIBLE
         val fadeOut = AlphaAnimation(1f, 0f)
@@ -2015,6 +2039,91 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Throwable) {}
     }
 
+    // ---- Runtime app URL ---------------------------------------------------------
+    // The wrapped site URL is baked at build time, but owners can change it on the
+    // dashboard at any point. Installed apps therefore ask the backend for the current
+    // URL, cache it locally, and switch over live — no rebuild / store update needed.
+
+    private fun configPrefs() = getSharedPreferences("appduct_config", MODE_PRIVATE)
+
+    private fun resolveStartupWebsiteUrl(): String {
+        return try {
+            val prefs = configPrefs()
+            val savedBaked = prefs.getString("baked_url", null)
+            if (savedBaked != bakedWebsiteUrl) {
+                // App was rebuilt with a different URL — the baked value wins and any
+                // previously cached override is dropped.
+                prefs.edit().putString("baked_url", bakedWebsiteUrl).remove("website_url").apply()
+                bakedWebsiteUrl
+            } else {
+                val override = prefs.getString("website_url", null)
+                if (!override.isNullOrBlank()) override else bakedWebsiteUrl
+            }
+        } catch (_: Exception) { bakedWebsiteUrl }
+    }
+
+    private fun isUsableHttpUrl(url: String): Boolean {
+        val lower = url.lowercase()
+        return (lower.startsWith("http://") || lower.startsWith("https://")) &&
+            !(Uri.parse(url).host ?: "").isEmpty()
+    }
+
+    /** Ask the backend for this project's current app URL and switch to it if it changed. */
+    private fun refreshRemoteWebsiteUrl(force: Boolean = false) {
+        if (!syncConfigured()) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastUrlCheckAt < urlCheckIntervalMs) return
+        lastUrlCheckAt = now
+        Thread {
+            try {
+                val urlStr = syncSupabaseUrl.trimEnd('/') +
+                    "/functions/v1/app-config?project_id=" + syncProjectId
+                val conn = URL(urlStr).openConnection() as HttpURLConnection
+                conn.connectTimeout = 6000
+                conn.readTimeout = 6000
+                conn.setRequestProperty("apikey", syncAnonKey)
+                conn.setRequestProperty("Authorization", "Bearer " + syncAnonKey)
+                conn.setRequestProperty("Accept", "application/json")
+                if (conn.responseCode in 200..299) {
+                    val body = conn.inputStream.bufferedReader().readText()
+                    val remote = Regex("\"website_url\"\\s*:\\s*\"([^\"]+)\"")
+                        .find(body)?.groupValues?.get(1)
+                        ?.replace("\\/", "/")
+                        ?.trim() ?: ""
+                    if (remote.isNotEmpty() && isUsableHttpUrl(remote) &&
+                        remote.trimEnd('/') != websiteUrl.trimEnd('/')
+                    ) {
+                        runOnUiThread { applyNewWebsiteUrl(remote) }
+                    }
+                }
+                conn.disconnect()
+            } catch (_: Exception) {}
+        }.start()
+    }
+
+    private fun applyNewWebsiteUrl(newUrl: String) {
+        websiteUrl = newUrl
+        try {
+            configPrefs().edit()
+                .putString("website_url", newUrl)
+                .putString("baked_url", bakedWebsiteUrl)
+                .apply()
+        } catch (_: Exception) {}
+        try {
+            if (::webView.isInitialized) {
+                // Old-origin cache/history is irrelevant now.
+                triedCacheFallback = false
+                webView.stopLoading()
+                webView.clearHistory()
+                webView.clearCache(true)
+                errorView.visibility = View.GONE
+                webView.visibility = View.VISIBLE
+                loadUrl()
+            }
+        } catch (_: Exception) {}
+    }
+
+
     /**
      * Ask the backend whether a newer release has been published for this app. When the
      * announced version code is higher than the installed one, notify the user once.
@@ -2199,6 +2308,9 @@ class MainActivity : AppCompatActivity() {
                         syncSignalInitialized = true
                         // Reload on any new signal we observe after the first poll.
                         // (First poll just establishes a baseline so we don't reload on launch.)
+                        // Any new signal may also mean the owner changed the app URL —
+                        // check that BEFORE reloading so we reload the right site.
+                        if (wasInitialized) refreshRemoteWebsiteUrl(true)
                         if (wasInitialized) reloadFromSyncSignal()
                         if (wasInitialized) checkForBackendRelease(true)
                     } else if (ts.isEmpty()) {
