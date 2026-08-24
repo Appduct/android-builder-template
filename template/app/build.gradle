@@ -11,12 +11,12 @@ if (keystorePropertiesFile.exists()) {
 
 android {
     namespace '%%PACKAGE_NAME%%'
-    compileSdk 35
+    compileSdk 36
 
     defaultConfig {
         applicationId "%%PACKAGE_NAME%%"
         minSdk 24
-        targetSdk 35
+        targetSdk 36
         versionCode %%VERSION_CODE%%
         versionName "%%VERSION_NAME%%"
         // Strip unused locales from packaged resources to reduce APK size
