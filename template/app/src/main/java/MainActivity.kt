@@ -110,9 +110,14 @@ class MainActivity : AppCompatActivity() {
     private val urlCheckIntervalMs: Long = 5 * 60 * 1000L
     private val expiryTimestamp: Long = %%EXPIRY_TIMESTAMP%%L
     private var splashDismissed = false
-    // Splash screen must stay visible for at least 3 seconds, even if the page loads faster.
-    private val minSplashDurationMs: Long = 3000L
+    // Load-aware splash: it stays up at least this long (avoids a jarring flash) and is
+    // dismissed as soon as the page paints — but never longer than the hard cap below.
+    private val minSplashDurationMs: Long = 900L
+    private val maxSplashDurationMs: Long = 3000L
     private var splashShownAt: Long = 0L
+    private var splashCapScheduled = false
+    private var prewarmedConnection = false
+
     private var fullscreenView: View? = null
     private var fullscreenRoot: FrameLayout? = null
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
@@ -307,12 +312,19 @@ class MainActivity : AppCompatActivity() {
             splashView.visibility = View.VISIBLE
             splashDismissed = false
             splashShownAt = android.os.SystemClock.elapsedRealtime()
+            splashCapScheduled = false
+            scheduleSplashCap()
             triedCacheFallback = false
             loadUrl()
         }
 
         // Runtime app URL: prefer the URL the dashboard last published for this project.
         websiteUrl = resolveStartupWebsiteUrl()
+
+        // Pre-warm the network path to the site (DNS + TCP + TLS + server warm-up) while
+        // the splash is still on screen, so the real page load starts from a hot connection.
+        prewarmWebsiteConnection()
+
 
         // Feature flags
         val pullToRefreshEnabled = %%PULL_TO_REFRESH%%
@@ -335,7 +347,9 @@ class MainActivity : AppCompatActivity() {
         // "Sign in with biometrics". App content loads immediately as usual.
         splashView.visibility = View.VISIBLE
         splashShownAt = android.os.SystemClock.elapsedRealtime()
+        scheduleSplashCap()
         if (!landingEnabled) webView.visibility = View.INVISIBLE
+
 
         if (landingEnabled && setupLanding()) {
             // Landing shown — skip auto-loading the website URL. Tile clicks load it.
@@ -504,10 +518,68 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) { callback(false) }
     }
 
+    /**
+     * Warms DNS, TCP and TLS to the wrapped site on a background thread while the splash is
+     * up. The WebView reuses the OS DNS cache and the server-side connection warm-up, so the
+     * first real navigation skips most of the handshake cost. Best-effort: never throws.
+     */
+    private fun prewarmWebsiteConnection() {
+        if (prewarmedConnection) return
+        prewarmedConnection = true
+        val target = websiteUrl
+        if (target.isBlank() || !target.startsWith("http")) return
+        Thread {
+            try {
+                val url = java.net.URL(target)
+                try { java.net.InetAddress.getAllByName(url.host) } catch (_: Exception) {}
+                val conn = url.openConnection() as java.net.HttpURLConnection
+                conn.requestMethod = "GET"
+                conn.connectTimeout = 4000
+                conn.readTimeout = 4000
+                conn.instanceFollowRedirects = true
+                conn.setRequestProperty("Accept-Encoding", "gzip")
+                conn.setRequestProperty("X-Appduct-Prewarm", "1")
+                try {
+                    conn.inputStream.use { input ->
+                        val buf = ByteArray(8 * 1024)
+                        var total = 0
+                        // Read a small slice so the origin starts generating the document,
+                        // then bail — we do not need the full body.
+                        while (total < 32 * 1024) {
+                            val read = input.read(buf)
+                            if (read <= 0) break
+                            total += read
+                        }
+                    }
+                } finally {
+                    try { conn.disconnect() } catch (_: Exception) {}
+                }
+            } catch (_: Throwable) {}
+        }.apply { isDaemon = true; priority = Thread.MAX_PRIORITY }.start()
+    }
+
+
+
+    /**
+     * Hard cap for the splash: whatever happens with the page load, the splash goes away
+     * after maxSplashDurationMs so the user is never stuck staring at branding.
+     */
+    private fun scheduleSplashCap() {
+        if (splashCapScheduled) return
+        splashCapScheduled = true
+        Handler(Looper.getMainLooper()).postDelayed({
+            splashCapScheduled = false
+            if (!splashDismissed) {
+                splashShownAt = 0L
+                dismissSplash()
+            }
+        }, maxSplashDurationMs)
+    }
+
     private fun dismissSplash() {
         if (splashDismissed) return
-        // Keep the splash on screen for the full minimum duration (3s) even when the
-        // page finishes loading sooner, so branding is always readable.
+        // Load-aware: dismiss as soon as the page paints, but keep a short minimum so the
+        // splash never flashes. The hard cap in scheduleSplashCap() bounds the wait at 3s.
         val shownFor = android.os.SystemClock.elapsedRealtime() - splashShownAt
         if (splashShownAt > 0L && shownFor < minSplashDurationMs) {
             Handler(Looper.getMainLooper()).postDelayed(
@@ -515,6 +587,7 @@ class MainActivity : AppCompatActivity() {
             )
             return
         }
+
         splashDismissed = true
         webView.visibility = View.VISIBLE
         val fadeOut = AlphaAnimation(1f, 0f)
@@ -822,7 +895,18 @@ class MainActivity : AppCompatActivity() {
                 injectRealtimeCompletionShim(view)
                 injectRealtimeCompletionShim(view)
             }
+            // First actual paint of the page — dismiss the splash here (load-aware) rather
+            // than waiting for every sub-resource to finish downloading.
+            override fun onPageCommitVisible(view: WebView?, url: String?) {
+                super.onPageCommitVisible(view, url)
+                if (!url.isNullOrBlank() && url != "about:blank") {
+                    progressBar.visibility = View.GONE
+                    dismissSplash()
+                    ensureContentVisible()
+                }
+            }
             override fun onPageFinished(view: WebView?, url: String?) {
+
                 progressBar.visibility = View.GONE
                 swipeRefresh.isRefreshing = false
                 injectNativeShareShim(view)
