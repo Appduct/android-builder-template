@@ -110,9 +110,9 @@ class MainActivity : AppCompatActivity() {
     private val urlCheckIntervalMs: Long = 5 * 60 * 1000L
     private val expiryTimestamp: Long = %%EXPIRY_TIMESTAMP%%L
     private var splashDismissed = false
-    // Load-aware splash: it stays up at least this long (avoids a jarring flash) and is
-    // dismissed as soon as the page paints — but never longer than the hard cap below.
-    private val minSplashDurationMs: Long = 900L
+    // Splash must remain visible for at least 3 seconds on every launch for consistent
+    // branding, then dismiss as soon as the page paints (but never beyond the hard cap).
+    private val minSplashDurationMs: Long = 3000L
     private val maxSplashDurationMs: Long = 3000L
     private var splashShownAt: Long = 0L
     private var splashCapScheduled = false
