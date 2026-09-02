@@ -807,6 +807,22 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch (_: Exception) {}
         }
+        // Suppress the system autofill / password-manager sheet ("Sign in to <App>" with the
+        // fingerprint prompt) that Android pops up whenever ANY input inside the WebView gains
+        // focus. In a browser this sheet is gated behind the user tapping the key icon, but a
+        // wrapped WebView is treated as a native form, so the biometric prompt appeared on every
+        // field tap. Biometric login stays available through the site's own
+        // "Sign in with biometrics" button, which calls the AndroidBiometric bridge explicitly.
+        try {
+            @Suppress("DEPRECATION")
+            webView.settings.saveFormData = false
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                webView.importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+                try {
+                    getSystemService(android.view.autofill.AutofillManager::class.java)?.disableAutofillServices()
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
         // Enable WebView remote debugging on debug builds so background XHR / fetch
         // failures can be inspected with chrome://inspect. Safe no-op in release.
         try {
