@@ -145,10 +145,26 @@ class MainActivity : AppCompatActivity() {
     // Manifest.permission.CAMERA / RECORD_AUDIO at runtime on Android 6+.
     private var pendingMediaRequest: PermissionRequest? = null
 
+    // True while the page holds a live microphone/camera capture (WebRTC audio/video call,
+    // recorder, screen share). Every automatic reload / pre-warm path must stand down while
+    // this is true: reloading mid-call leaves the old page's tracks holding the mic, which
+    // makes the next getUserMedia() fail with "microphone is being used by another app or
+    // browser tab" (NotReadableError) and drops the call.
+    @Volatile private var mediaCaptureActive = false
+    private var audioFocusRequested = false
+    private var previousAudioMode: Int? = null
+
+
+
     // Offline pre-warm cache state
     private var prewarmDone = false
     private var prewarmWebView: WebView? = null
     private var triedCacheFallback = false
+    // True once the WebView has painted real site content at least once (live or cached).
+    // When true, a later network failure must NOT replace the visible page with an error
+    // screen — we keep the cached content and only surface a toast.
+    private var hasRenderedContent = false
+    private var lastOfflineToastAt = 0L
     // Offline Mode feature flag, kept as a field so every load path (initial load,
     // refresh, sync reload, error fallback, connectivity changes) can honour it.
     private var offlineModeEnabled = false
@@ -365,12 +381,18 @@ class MainActivity : AppCompatActivity() {
                 triedCacheFallback = true
                 loadUrl()
             } else {
-                dismissSplash()
-                showError("Please check your internet connection and try again.")
+                // No network and Offline Mode off: still attempt the cached copy once so
+                // users see content instead of an error screen when a cache exists.
+                webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                triedCacheFallback = true
+                showOfflineToast()
+                loadUrl()
             }
         }
 
-        if (offlineModeEnabled) registerOfflineConnectivityWatcher()
+        // Always watch connectivity so the app recovers automatically (and retries the
+        // live load) once the network returns, whether or not Offline Mode is enabled.
+        registerOfflineConnectivityWatcher()
 
 
         syncHandler.removeCallbacks(syncRunnable)
@@ -486,7 +508,7 @@ class MainActivity : AppCompatActivity() {
      * or an in-progress file picker. The result is delivered async on the UI thread.
      */
     private fun isUserBusy(callback: (Boolean) -> Unit) {
-        if (isPickingFile || fullscreenView != null) { callback(true); return }
+        if (isPickingFile || fullscreenView != null || mediaCaptureActive) { callback(true); return }
         if (!::webView.isInitialized) { callback(false); return }
         val js = """(function(){try{
             var m=document.querySelectorAll('video,audio');
@@ -906,16 +928,20 @@ class MainActivity : AppCompatActivity() {
                     return
                 }
                 progressBar.visibility = View.GONE
+                // A brand-new document holds no capture yet; clear the flag so a stale value
+                // from the previous page can never block reloads (or keep the call audio mode).
+                setMediaCaptureActiveInternal(false)
                 injectNativeShareShim(view)
                 injectBiometricLoginShim(view)
                 injectRealtimeCompletionShim(view)
-                injectRealtimeCompletionShim(view)
+                injectMediaCaptureShim(view)
             }
             // First actual paint of the page — dismiss the splash here (load-aware) rather
             // than waiting for every sub-resource to finish downloading.
             override fun onPageCommitVisible(view: WebView?, url: String?) {
                 super.onPageCommitVisible(view, url)
                 if (!url.isNullOrBlank() && url != "about:blank") {
+                    hasRenderedContent = true
                     progressBar.visibility = View.GONE
                     dismissSplash()
                     ensureContentVisible()
@@ -928,7 +954,7 @@ class MainActivity : AppCompatActivity() {
                 injectNativeShareShim(view)
                 injectBiometricLoginShim(view)
                 injectRealtimeCompletionShim(view)
-                injectRealtimeCompletionShim(view)
+                injectMediaCaptureShim(view)
                 try { CookieManager.getInstance().flush() } catch (_: Exception) {}
                 resetLandingRootHistoryIfNeeded(url)
                 dismissSplash()
@@ -936,7 +962,7 @@ class MainActivity : AppCompatActivity() {
                 ensureContentVisible()
 
                 // Pre-warm offline cache once per launch when Offline Mode is on and we're online
-                if (offlineMode && !prewarmDone && isNetworkAvailable()) {
+                if (offlineMode && !prewarmDone && isNetworkAvailable() && !mediaCaptureActive) {
                     prewarmDone = true
                     Handler(Looper.getMainLooper()).postDelayed({ prewarmOfflineCache() }, 1500)
                 }
@@ -949,17 +975,42 @@ class MainActivity : AppCompatActivity() {
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 if (request?.isForMainFrame == true) {
+                    // Kill WebView's built-in "Webpage not available" page immediately — it
+                    // prints the site URL on screen. We never let it become visible.
+                    try { view?.stopLoading() } catch (_: Exception) {}
                     progressBar.visibility = View.GONE
                     swipeRefresh.isRefreshing = false
-                    if (offlineMode && !triedCacheFallback) {
-                        // Try loading from cache as fallback
+                    if (!triedCacheFallback) {
+                        // Always try the cached copy first, regardless of Offline Mode.
                         triedCacheFallback = true
+                        try {
+                            webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                            webView.reload()
+                        } catch (_: Exception) {}
+                        showOfflineToast()
+                    } else {
+                        handleUnreachable()
+                    }
+                }
+            }
+
+            @Suppress("DEPRECATION")
+            override fun onReceivedError(
+                view: WebView?, errorCode: Int, description: String?, failingUrl: String?
+            ) {
+                // Legacy callback on older WebView builds — suppress the native page too.
+                try { view?.stopLoading() } catch (_: Exception) {}
+                progressBar.visibility = View.GONE
+                swipeRefresh.isRefreshing = false
+                if (!triedCacheFallback) {
+                    triedCacheFallback = true
+                    try {
                         webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
                         webView.reload()
-                    } else {
-                        dismissSplash()
-                        showError("Please check your internet connection and try again.")
-                    }
+                    } catch (_: Exception) {}
+                    showOfflineToast()
+                } else {
+                    handleUnreachable()
                 }
             }
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -1653,7 +1704,12 @@ class MainActivity : AppCompatActivity() {
             if (isNetworkAvailable()) {
                 refreshFromUserGesture()
             }
-            else { swipeRefresh.isRefreshing = false; showError("Please check your internet connection and try again.") }
+            else {
+                swipeRefresh.isRefreshing = false
+                // Never replace visible (possibly cached) content with an error screen here.
+                showOfflineToast()
+                if (!hasRenderedContent) handleUnreachable()
+            }
         }
     }
 
@@ -1879,7 +1935,7 @@ class MainActivity : AppCompatActivity() {
                         triedCacheFallback = false
                         applyOfflineCacheMode()
                         try {
-                            if (::webView.isInitialized && !isPickingFile && fullscreenView == null) {
+                            if (::webView.isInitialized && !isPickingFile && fullscreenView == null && !mediaCaptureActive) {
                                 val current = webView.url
                                 if (current.isNullOrBlank() || current == "about:blank") loadUrl() else webView.reload()
                             }
@@ -1953,6 +2009,8 @@ class MainActivity : AppCompatActivity() {
      */
     private fun requestCompletionRevalidation(reason: String? = null) {
         if (!::webView.isInitialized || isPickingFile || !isNetworkAvailable()) return
+        // A live audio/video call must never be nudged or reloaded.
+        if (mediaCaptureActive) return
         val now = System.currentTimeMillis()
         // Debounce redundant nudges from stacked toasts.
         if (now - lastCompletionReloadRequestAt < 1200L) return
@@ -2006,7 +2064,7 @@ class MainActivity : AppCompatActivity() {
     private fun reloadFromSyncSignal() {
         // Never reload while the user is interacting with the system file/camera
         // picker — it would discard the in-progress upload.
-        if (isPickingFile) return
+        if (isPickingFile || mediaCaptureActive) return
         val now = System.currentTimeMillis()
         if (now - lastSyncReloadAt < 1500L) return
         syncHandler.post {
@@ -2465,22 +2523,39 @@ class MainActivity : AppCompatActivity() {
                     val regex = Regex("\"(https?://[^\"]+)\"")
                     regex.findAll(raw).forEach { urls.add(it.groupValues[1]) }
                 } catch (_: Exception) {}
-                if (urls.isEmpty()) return@evaluateJavascript
-                runPrewarmQueue(urls.take(5))
+                // Never silently open call / live-room / auth-sensitive routes in the hidden
+                // pre-warm WebView: it shares cookies with the visible page, so the site sees a
+                // second live session ("microphone in use by another tab / open studio room")
+                // and may even grab the microphone in the background.
+                val unsafe = Regex(
+                    "(call|meet|meeting|room|studio|live|stream|broadcast|record|conference|video|voice|audio|webrtc|logout|sign-?out)",
+                    RegexOption.IGNORE_CASE
+                )
+                val safeUrls = urls.filter { !unsafe.containsMatchIn(it) }
+                if (safeUrls.isEmpty() || mediaCaptureActive) return@evaluateJavascript
+                runPrewarmQueue(safeUrls.take(5))
             }
         } catch (_: Exception) {}
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun runPrewarmQueue(urls: List<String>) {
-        if (urls.isEmpty()) return
+        if (urls.isEmpty() || mediaCaptureActive) return
         if (prewarmWebView == null) {
             prewarmWebView = WebView(this).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 settings.cacheMode = WebSettings.LOAD_DEFAULT
                 settings.userAgentString = webView.settings.userAgentString
+                settings.mediaPlaybackRequiresUserGesture = true
                 visibility = View.GONE
+                // Hard-deny any camera/microphone request from the hidden pre-warm page so it
+                // can never take the capture devices away from the visible page.
+                webChromeClient = object : WebChromeClient() {
+                    override fun onPermissionRequest(request: PermissionRequest?) {
+                        try { request?.deny() } catch (_: Exception) {}
+                    }
+                }
             }
         }
         val pw = prewarmWebView ?: return
@@ -2511,6 +2586,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        try { setMediaCaptureActiveInternal(false) } catch (_: Exception) {}
         try { prewarmWebView?.destroy() } catch (_: Exception) {}
         prewarmWebView = null
         try { appUpdateManager?.unregisterListener(appUpdateListener) } catch (_: Throwable) {}
@@ -2610,6 +2686,19 @@ class MainActivity : AppCompatActivity() {
                 try { this@MainActivity.requestCompletionRevalidation(reason) } catch (_: Exception) {}
             }
         }
+
+        /**
+         * Reported by the injected media-capture shim whenever the page starts or stops using
+         * the microphone/camera (WebRTC audio & video calls, recorders, screen share).
+         */
+        @android.webkit.JavascriptInterface
+        fun setMediaCaptureActive(active: Boolean) {
+            runOnUiThread {
+                try { this@MainActivity.setMediaCaptureActiveInternal(active) } catch (_: Exception) {}
+            }
+        }
+
+
 
         /**
          * Save a base64-encoded blob (e.g. from a blob: download or a generated PDF) into
@@ -2805,6 +2894,126 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Audio/video calling support.
+     *
+     * WebRTC calls work in Chrome but failed inside the wrapped app with
+     * "Your microphone is being used by another app or browser tab" because:
+     *  1. background reload paths (sync poll, connectivity regained, resume, completion
+     *     watcher, offline pre-warm) could reload or silently open the site while a call
+     *     was live — the abandoned page kept its MediaStreamTracks, so the mic stayed
+     *     occupied and the new page's getUserMedia() failed with NotReadableError;
+     *  2. the hidden pre-warm WebView loaded other same-origin pages (including call /
+     *     studio room routes) with the same cookies, so the site saw a second live
+     *     session — exactly the "or any open studio room" case in the error message;
+     *  3. the audio session stayed in normal media mode, so mic capture and playback
+     *     fought over routing.
+     *
+     * This shim tracks live capture in the page and reports it to the native layer, and
+     * always stops tracks before the page unloads so the mic is free for the next page.
+     */
+    private fun injectMediaCaptureShim(view: WebView?) {
+        val js = """
+            (function(){try{
+              if(window.__appductMediaCaptureShim)return;window.__appductMediaCaptureShim=1;
+              var live=[];
+              function report(){
+                var active=false;
+                for(var i=0;i<live.length;i++){try{if(live[i].readyState==='live'){active=true;break;}}catch(e){}}
+                window.__appductCaptureActive=active;
+                try{if(window.AndroidShareBridge&&window.AndroidShareBridge.setMediaCaptureActive)window.AndroidShareBridge.setMediaCaptureActive(active);}catch(e){}
+              }
+              function track(stream){
+                try{
+                  var ts=stream.getTracks?stream.getTracks():[];
+                  for(var i=0;i<ts.length;i++){(function(t){
+                    if(live.indexOf(t)===-1)live.push(t);
+                    try{t.addEventListener('ended',function(){setTimeout(report,0);});}catch(e){}
+                    try{var stop=t.stop.bind(t);t.stop=function(){try{return stop();}finally{setTimeout(report,0);}};}catch(e){}
+                  })(ts[i]);}
+                }catch(e){}
+                report();
+              }
+              function releaseAll(){
+                for(var i=0;i<live.length;i++){try{live[i].stop();}catch(e){}}
+                live=[];report();
+              }
+              try{
+                var md=navigator.mediaDevices;
+                if(md&&md.getUserMedia){
+                  var gum=md.getUserMedia.bind(md);
+                  md.getUserMedia=function(c){return gum(c).then(function(s){track(s);return s;});};
+                }
+                if(md&&md.getDisplayMedia){
+                  var gdm=md.getDisplayMedia.bind(md);
+                  md.getDisplayMedia=function(c){return gdm(c).then(function(s){track(s);return s;});};
+                }
+              }catch(e){}
+              // Legacy API some libraries still fall back to.
+              try{
+                if(navigator.getUserMedia){var lg=navigator.getUserMedia.bind(navigator);
+                  navigator.getUserMedia=function(c,ok,err){return lg(c,function(s){try{track(s);}catch(e){}if(ok)ok(s);},err);};}
+              }catch(e){}
+              // Free the microphone/camera BEFORE the document goes away, otherwise the
+              // next page load inherits an occupied device.
+              try{window.addEventListener('pagehide',releaseAll,true);}catch(e){}
+              try{window.addEventListener('beforeunload',releaseAll,true);}catch(e){}
+              try{setInterval(report,4000);}catch(e){}
+              report();
+            }catch(e){}})();
+        """.trimIndent()
+        try { view?.evaluateJavascript(js, null) } catch (_: Exception) {}
+    }
+
+    /**
+     * Puts the audio session into voice-communication mode (and back) so mic capture and
+     * call playback route correctly and the OS does not hand the mic to another stream.
+     */
+    private fun applyCallAudioSession(active: Boolean) {
+        try {
+            val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
+            if (active) {
+                if (previousAudioMode == null) previousAudioMode = am.mode
+                if (!audioFocusRequested) {
+                    @Suppress("DEPRECATION")
+                    am.requestAudioFocus(
+                        null,
+                        android.media.AudioManager.STREAM_VOICE_CALL,
+                        android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                    )
+                    audioFocusRequested = true
+                }
+                am.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
+                try { window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) } catch (_: Exception) {}
+            } else {
+                if (audioFocusRequested) {
+                    @Suppress("DEPRECATION")
+                    am.abandonAudioFocus(null)
+                    audioFocusRequested = false
+                }
+                am.mode = previousAudioMode ?: android.media.AudioManager.MODE_NORMAL
+                previousAudioMode = null
+                try { window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun setMediaCaptureActiveInternal(active: Boolean) {
+        if (mediaCaptureActive == active) return
+        mediaCaptureActive = active
+        applyCallAudioSession(active)
+        if (active) {
+            // Cancel every pending automatic reload so a live call is never interrupted.
+            try { syncHandler.removeCallbacks(syncRunnable) } catch (_: Exception) {}
+            try { syncHandler.post(syncRunnable) } catch (_: Exception) {}
+            try { prewarmWebView?.stopLoading() } catch (_: Exception) {}
+            try { prewarmWebView?.destroy() } catch (_: Exception) {}
+            prewarmWebView = null
+        }
+    }
+
+
+
+    /**
      * Some wrapped apps complete a save/upload, show a success toast, then rely on a
      * browser focus / visibility / realtime revalidation to update the previous list
      * screen. Android's file picker + SwipeRefreshLayout can briefly suspend the WebView,
@@ -2877,6 +3086,37 @@ class MainActivity : AppCompatActivity() {
             }catch(e){}})();
         """.trimIndent()
         try { view?.evaluateJavascript(js, null) } catch (_: Exception) {}
+    }
+
+
+
+
+    /** Throttled, URL-free connectivity notice. */
+    private fun showOfflineToast() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastOfflineToastAt < 4000L) return
+        lastOfflineToastAt = now
+        try {
+            android.widget.Toast.makeText(
+                this, "Please check your internet connection", android.widget.Toast.LENGTH_SHORT
+            ).show()
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * The site could not be reached. If cached content is already on screen we keep it and
+     * only toast; otherwise we show the branded offline graphic. The native WebView error
+     * page (which leaks the URL) is never shown.
+     */
+    private fun handleUnreachable() {
+        showOfflineToast()
+        dismissSplash()
+        if (hasRenderedContent) {
+            // Cached page is visible — leave it alone.
+            try { webView.visibility = View.VISIBLE } catch (_: Exception) {}
+            return
+        }
+        showError("Please check your internet connection and try again.")
     }
 
     private fun showError(message: String) {
