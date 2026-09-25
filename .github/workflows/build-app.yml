@@ -137,8 +137,6 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           packages: ''
-        with:
-          packages: ''
 
 
       - name: Notify build started
