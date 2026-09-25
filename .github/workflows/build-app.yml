@@ -99,12 +99,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Keep time available for the terminal failure callback after Gradle stops.
+    # Leave enough job time for the failure callback after the Gradle command
+    # reaches its own controlled timeout.
     timeout-minutes: 35
-
     concurrency:
       group: appduct-android-${{ inputs.build_id }}
       cancel-in-progress: true
+
     steps:
       - name: Checkout template
         uses: actions/checkout@v4
@@ -115,7 +116,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Cache Android SDK
+      - name: Cache Android SDK build cache
         uses: actions/cache@v4
         with:
           path: |
@@ -128,11 +129,17 @@ jobs:
         with:
           gradle-version: '8.5'
           cache-read-only: false
+          # Reuse one warm dependency cache across every app build.
+          gradle-home-cache-cleanup: true
+
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: ''
+        with:
+          packages: ''
+
 
       - name: Notify build started
         env:
@@ -154,7 +161,7 @@ jobs:
           SYNC_CONFIG_JSON: ${{ inputs.sync_config_json }}
         run: |
           mkdir -p build-output
-          command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
+          command -v jq >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
 
           # Parse consolidated JSON blobs (GitHub workflow_dispatch has a 25-input limit)
           EF="${EXTRA_FEATURES_JSON:-{}}"
@@ -258,12 +265,94 @@ jobs:
             mv build-output/app/src/main/java/KeepAliveService.kt "build-output/app/src/main/java/${PACKAGE_PATH}/KeepAliveService.kt"
           fi
 
+      - name: Verify AdMob injection
+        if: inputs.admob_enabled == 'true' || inputs.admob_enabled == true
+        run: |
+          set -e
+          echo "🔍 Verifying AdMob IDs are injected (not placeholders)..."
+          MANIFEST="build-output/app/src/main/AndroidManifest.xml"
+          MAIN_ACT=$(find build-output/app/src/main/java -name MainActivity.kt | head -n1)
+          FAIL=0
+
+          check_id() {
+            local name="$1" value="$2" pattern="$3"
+            if [ -z "$value" ] || [ "$value" = "none" ] || [ "$value" = "null" ]; then
+              echo "❌ $name is empty/none"; FAIL=1; return
+            fi
+            if ! echo "$value" | grep -Eq "$pattern"; then
+              echo "❌ $name has invalid format: $value"; FAIL=1; return
+            fi
+            echo "✅ $name = $value"
+          }
+
+          ADMOB_APP_ID_INPUT="${{ inputs.admob_app_id }}"
+          ADMOB_BANNER_ID_INPUT="${{ inputs.admob_banner_id }}"
+          ADMOB_INTERSTITIAL_ID_INPUT="${{ inputs.admob_interstitial_id }}"
+          APPID_RE='^ca-app-pub-[0-9]+~[0-9]+$'
+          UNIT_RE='^ca-app-pub-[0-9]+/[0-9]+$'
+
+          check_id "App ID"           "$ADMOB_APP_ID_INPUT"          "$APPID_RE"
+          check_id "Banner Unit ID"   "$ADMOB_BANNER_ID_INPUT"       "$UNIT_RE"
+          check_id "Interstitial Unit ID" "$ADMOB_INTERSTITIAL_ID_INPUT" "$UNIT_RE"
+
+          # Residual placeholder scan
+          if grep -RInE '%%ADMOB_[A-Z_]+%%' build-output/app/src/main 2>/dev/null; then
+            echo "❌ Found unsubstituted AdMob placeholders above"; FAIL=1
+          fi
+
+          # Manifest must declare APPLICATION_ID with the real app id
+          if ! grep -q 'com.google.android.gms.ads.APPLICATION_ID' "$MANIFEST"; then
+            echo "❌ Manifest missing AdMob APPLICATION_ID meta-data"; FAIL=1
+          elif ! grep -q "$ADMOB_APP_ID_INPUT" "$MANIFEST"; then
+            echo "❌ Manifest APPLICATION_ID does not contain real App ID"; FAIL=1
+          else
+            echo "✅ Manifest APPLICATION_ID present"
+          fi
+
+          # Kotlin runtime must contain the unit IDs and SDK init
+          if [ -z "$MAIN_ACT" ] || [ ! -f "$MAIN_ACT" ]; then
+            echo "❌ MainActivity.kt not found"; FAIL=1
+          else
+            grep -q "MobileAds.initialize" "$MAIN_ACT" || { echo "❌ MainActivity missing MobileAds.initialize"; FAIL=1; }
+            grep -q "$ADMOB_BANNER_ID_INPUT" "$MAIN_ACT" || { echo "❌ MainActivity missing real Banner ID"; FAIL=1; }
+            grep -q "$ADMOB_INTERSTITIAL_ID_INPUT" "$MAIN_ACT" || { echo "❌ MainActivity missing real Interstitial ID"; FAIL=1; }
+          fi
+
+          if [ "${{ inputs.admob_app_open_enabled }}" = "true" ]; then
+            AO_ID=$(echo '${{ inputs.extra_features_json }}' | jq -r '.admob_app_open_id // empty')
+            check_id "App Open Unit ID" "$AO_ID" "$UNIT_RE"
+            grep -q "$AO_ID" "$MAIN_ACT" || { echo "❌ MainActivity missing App Open ID"; FAIL=1; }
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo ""
+            echo "💥 AdMob verification FAILED — aborting build so ads are guaranteed to work in next APK."
+            exit 1
+          fi
+          echo "🎉 All AdMob IDs successfully injected."
+
+
       - name: Ensure Gradle wrapper
         working-directory: build-output
         run: |
           if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
             gradle wrapper --gradle-version 8.5 --no-daemon
           fi
+
+      - name: Install image tools
+        run: |
+          # Newer GitHub runner images no longer ship ImageMagick, and installing
+          # without refreshing the package index fails (exit 100).
+          if ! command -v convert >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+            for i in 1 2 3; do
+              sudo apt-get update -y > /dev/null 2>&1 && sudo apt-get install -y --no-install-recommends imagemagick jq > /dev/null 2>&1 && break
+              echo "Image tools install attempt $i failed; retrying..."; sleep 5
+            done
+          fi
+          if ! command -v convert >/dev/null 2>&1 && command -v magick >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v magick)" /usr/local/bin/convert
+          fi
+          command -v convert
 
       - name: Download app icon
         if: inputs.app_icon_url != ''
@@ -280,7 +369,7 @@ jobs:
           curl -fsSL --max-time 30 "$ICON_URL" -o /tmp/icon_original.img || true
           
           # Install imagemagick
-          sudo apt-get install -y imagemagick > /dev/null 2>&1
+          command -v convert >/dev/null 2>&1 || sudo apt-get install -y imagemagick > /dev/null 2>&1
 
           if ! convert /tmp/icon_original.img -resize 192x192 build-output/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png 2>/tmp/icon_convert_error.log; then
             echo "Icon download was not a valid image; generating a default icon instead."
@@ -303,7 +392,7 @@ jobs:
           DRAWABLE_DIR="build-output/app/src/main/res/drawable"
           mkdir -p "$DRAWABLE_DIR"
           
-          command -v convert >/dev/null 2>&1 || sudo apt-get install -y imagemagick > /dev/null 2>&1 || true
+          command -v convert >/dev/null 2>&1 || command -v convert >/dev/null 2>&1 || sudo apt-get install -y imagemagick > /dev/null 2>&1 || true
           
           if [ -n "$SPLASH_URL" ] && [ "$SPLASH_URL" != "" ]; then
             echo "Downloading splash image from $SPLASH_URL"
@@ -335,7 +424,7 @@ jobs:
           ASSETS_DIR="build-output/app/src/main/assets"
           DRAWABLE_DIR="build-output/app/src/main/res/drawable"
           mkdir -p "$ASSETS_DIR" "$DRAWABLE_DIR"
-          command -v jq >/dev/null 2>&1 && command -v convert >/dev/null 2>&1 || sudo apt-get install -y jq imagemagick > /dev/null 2>&1 || true
+          command -v jq >/dev/null 2>&1 && command -v convert >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 && command -v convert >/dev/null 2>&1 || sudo apt-get install -y jq imagemagick > /dev/null 2>&1 || true
 
           EF="${EXTRA_FEATURES_JSON:-{}}"
           MULTI_LINKS_JSON=$(echo "$EF" | jq -c '.multi_links // []' 2>/dev/null || echo '[]')
@@ -369,7 +458,7 @@ jobs:
           SYNC_CONFIG_JSON: ${{ inputs.sync_config_json }}
         run: |
           set -e
-          command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
+          command -v jq >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
           SC="${SIGNING_CONFIG_JSON:-}"
           if [ -z "$SC" ] || [ "$SC" = "{}" ]; then
             SC=$(printf '%s' "${SYNC_CONFIG_JSON:-{}}" | jq -c '.signing_config // {}' 2>/dev/null || echo '{}')
