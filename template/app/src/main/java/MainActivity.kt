@@ -593,7 +593,11 @@ class MainActivity : AppCompatActivity() {
             splashCapScheduled = false
             if (!splashDismissed) {
                 splashShownAt = 0L
-                dismissSplash()
+                if (!hasRenderedContent && !landingEnabled) {
+                    showError("Please check your internet connection and try again.")
+                } else {
+                    dismissSplash()
+                }
             }
         }, maxSplashDurationMs)
     }
@@ -611,7 +615,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         splashDismissed = true
-        webView.visibility = View.VISIBLE
+        if (hasRenderedContent) webView.visibility = View.VISIBLE
         val fadeOut = AlphaAnimation(1f, 0f)
         fadeOut.duration = 400
         fadeOut.fillAfter = true
@@ -942,6 +946,9 @@ class MainActivity : AppCompatActivity() {
                 super.onPageCommitVisible(view, url)
                 if (!url.isNullOrBlank() && url != "about:blank") {
                     hasRenderedContent = true
+                    errorView.visibility = View.GONE
+                    swipeRefresh.visibility = View.VISIBLE
+                    webView.visibility = View.VISIBLE
                     progressBar.visibility = View.GONE
                     dismissSplash()
                     ensureContentVisible()
@@ -975,22 +982,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 if (request?.isForMainFrame == true) {
-                    // Kill WebView's built-in "Webpage not available" page immediately — it
-                    // prints the site URL on screen. We never let it become visible.
-                    try { view?.stopLoading() } catch (_: Exception) {}
-                    progressBar.visibility = View.GONE
-                    swipeRefresh.isRefreshing = false
-                    if (!triedCacheFallback) {
-                        // Always try the cached copy first, regardless of Offline Mode.
-                        triedCacheFallback = true
-                        try {
-                            webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
-                            webView.reload()
-                        } catch (_: Exception) {}
-                        showOfflineToast()
-                    } else {
-                        handleUnreachable()
-                    }
+                    handleMainFrameLoadError(view)
                 }
             }
 
@@ -998,20 +990,13 @@ class MainActivity : AppCompatActivity() {
             override fun onReceivedError(
                 view: WebView?, errorCode: Int, description: String?, failingUrl: String?
             ) {
-                // Legacy callback on older WebView builds — suppress the native page too.
-                try { view?.stopLoading() } catch (_: Exception) {}
-                progressBar.visibility = View.GONE
-                swipeRefresh.isRefreshing = false
-                if (!triedCacheFallback) {
-                    triedCacheFallback = true
-                    try {
-                        webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
-                        webView.reload()
-                    } catch (_: Exception) {}
-                    showOfflineToast()
-                } else {
-                    handleUnreachable()
-                }
+                // This deprecated callback also fires for failed images and scripts. Only
+                // handle it when it identifies the active top-level page; the modern callback
+                // above handles main-frame errors on supported Android versions.
+                val activeUrl = view?.url
+                if (failingUrl.isNullOrBlank() ||
+                    (failingUrl != activeUrl && failingUrl != websiteUrl)) return
+                handleMainFrameLoadError(view)
             }
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: return false
@@ -3103,33 +3088,48 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {}
     }
 
+    /** Hide the WebView before fallback navigation so Chromium's URL-bearing error document
+     * can never be painted, even briefly. Try one cache-only load, then show the native screen. */
+    private fun handleMainFrameLoadError(view: WebView?) {
+        val target = view ?: if (::webView.isInitialized) webView else return
+        target.visibility = View.GONE
+        try { target.stopLoading() } catch (_: Exception) {}
+        progressBar.visibility = View.GONE
+        swipeRefresh.isRefreshing = false
+        if (!triedCacheFallback) {
+            triedCacheFallback = true
+            try {
+                target.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                target.reload()
+            } catch (_: Exception) {}
+            showOfflineToast()
+        } else {
+            handleUnreachable()
+        }
+    }
+
     /**
-     * The site could not be reached. If cached content is already on screen we keep it and
-     * only toast; otherwise we show the branded offline graphic. The native WebView error
-     * page (which leaks the URL) is never shown.
+     * The site and cached copy could not be reached. Keep the failed document hidden and
+     * replace it with the native offline screen; never leave Chromium's error document visible.
      */
     private fun handleUnreachable() {
         showOfflineToast()
-        dismissSplash()
-        if (hasRenderedContent) {
-            // Cached page is visible — leave it alone.
-            try { webView.visibility = View.VISIBLE } catch (_: Exception) {}
-            return
-        }
         showError("Please check your internet connection and try again.")
     }
 
     private fun showError(message: String) {
-        try {
-            webView.stopLoading()
-            // Clear any native error page (which would otherwise reveal the URL)
-            webView.loadUrl("about:blank")
-        } catch (_: Exception) {}
+        // Hide first: loading about:blank below is only cleanup and must never expose the
+        // failed navigation's built-in Chromium error page to the user.
         webView.visibility = View.GONE
+        swipeRefresh.visibility = View.GONE
         splashView.visibility = View.GONE
         errorView.visibility = View.VISIBLE
         errorText.text = message
         progressBar.visibility = View.GONE
+        try {
+            webView.stopLoading()
+            webView.loadUrl("about:blank")
+        } catch (_: Exception) {}
     }
     private fun showExpiredScreen() {
         val container = LinearLayout(this).apply {
