@@ -3146,7 +3146,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, 24)
         }
         val msg = TextView(this).apply {
-            text = "Your 7-day free trial of this app has ended.\n\nPlease contact the app owner to upgrade and continue using this app."
+            text = "Your 4-day free trial of this app has ended.\n\nPlease contact the app owner to upgrade and continue using this app."
             setTextColor(Color.parseColor("#CBD5E1"))
             textSize = 15f
             gravity = android.view.Gravity.CENTER
