@@ -63,8 +63,9 @@ class MainActivity : AppCompatActivity() {
     private val keepAliveEnabled: Boolean = %%KEEP_ALIVE_ENABLED%%
     @Volatile private var activityInForeground = false
     @Volatile private var activityDestroyed = false
+    @Volatile private var backgroundServiceActive = false
     private fun shouldRunLiveSync(): Boolean =
-        !activityDestroyed && (activityInForeground || keepAliveEnabled)
+        !activityDestroyed && (activityInForeground || (keepAliveEnabled && backgroundServiceActive))
 
     // AdMob — values templated at build time.
     private val admobEnabled: Boolean = %%ADMOB_ENABLED%%
@@ -2107,6 +2108,22 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         activityInForeground = true
+        if (keepAliveEnabled) {
+            KeepAliveService.observeState { active ->
+                backgroundServiceActive = active
+                if (!shouldRunLiveSync()) {
+                    stopSyncRealtime()
+                    syncHandler.removeCallbacks(syncRunnable)
+                } else {
+                    syncHandler.removeCallbacks(syncRunnable)
+                    syncHandler.post(syncRunnable)
+                    startSyncRealtime()
+                }
+            }
+            KeepAliveService.setAppBackgrounded(false)
+            // Recover a service stopped by Android only while starting is permitted.
+            %%KEEP_ALIVE_START%%
+        }
         // Self-heal: if a previous fullscreen video session left the WebView hidden or a
         // stale fullscreen holder attached over the app, restore the content now.
         if (::webView.isInitialized) ensureContentVisible()
@@ -2167,10 +2184,11 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         activityInForeground = false
         lastPauseTime = System.currentTimeMillis()
+        if (keepAliveEnabled) KeepAliveService.setAppBackgrounded(true)
         try { CookieManager.getInstance().flush() } catch (_: Exception) {}
         // Opted-in live work must not disconnect just because Home was pressed.
         // This keeps native sync running, but does not turn WebView into a push receiver.
-        if (!keepAliveEnabled) {
+        if (!keepAliveEnabled || !backgroundServiceActive) {
             stopSyncRealtime()
             syncHandler.removeCallbacks(syncRunnable)
         }
@@ -2598,6 +2616,11 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         activityDestroyed = true
         activityInForeground = false
+        backgroundServiceActive = false
+        if (keepAliveEnabled) {
+            KeepAliveService.observeState(null)
+            KeepAliveService.setAppBackgrounded(false)
+        }
         stopSyncRealtime()
         syncHandler.removeCallbacksAndMessages(null)
         try { setMediaCaptureActiveInternal(false) } catch (_: Exception) {}
