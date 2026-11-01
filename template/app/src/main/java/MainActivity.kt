@@ -60,6 +60,11 @@ class MainActivity : AppCompatActivity() {
     // Enables the AndroidBiometric JS bridge so the wrapped web login page can trigger
     // an OS fingerprint / face prompt. Never gates app startup.
     private val biometricEnabled: Boolean = %%BIOMETRIC_ENABLED%%
+    private val keepAliveEnabled: Boolean = %%KEEP_ALIVE_ENABLED%%
+    @Volatile private var activityInForeground = false
+    @Volatile private var activityDestroyed = false
+    private fun shouldRunLiveSync(): Boolean =
+        !activityDestroyed && (activityInForeground || keepAliveEnabled)
 
     // AdMob — values templated at build time.
     private val admobEnabled: Boolean = %%ADMOB_ENABLED%%
@@ -202,6 +207,7 @@ class MainActivity : AppCompatActivity() {
     }
     private val syncHeartbeatRunnable = object : Runnable {
         override fun run() {
+            if (!shouldRunLiveSync()) return
             syncSocket?.send("""{"topic":"phoenix","event":"heartbeat","payload":{},"ref":"${nextSyncRef()}"}""")
             syncHandler.postDelayed(this, 25000L)
         }
@@ -209,6 +215,7 @@ class MainActivity : AppCompatActivity() {
     private val syncHandler = Handler(Looper.getMainLooper())
     private val syncRunnable = object : Runnable {
         override fun run() {
+            if (!shouldRunLiveSync()) return
             checkSyncSignal()
             checkForBackendRelease()
             refreshRemoteWebsiteUrl()
@@ -219,6 +226,7 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        activityInForeground = true
 
         // Tablet fix: on devices with smallestScreenWidthDp >= 600 (7"+ tablets, Chromebooks,
         // foldables in outer state, Android TV), never enforce the manifest's portrait lock.
@@ -2098,6 +2106,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        activityInForeground = true
         // Self-heal: if a previous fullscreen video session left the WebView hidden or a
         // stale fullscreen holder attached over the app, restore the content now.
         if (::webView.isInitialized) ensureContentVisible()
@@ -2156,10 +2165,15 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        activityInForeground = false
         lastPauseTime = System.currentTimeMillis()
         try { CookieManager.getInstance().flush() } catch (_: Exception) {}
-        stopSyncRealtime()
-        syncHandler.removeCallbacks(syncRunnable)
+        // Opted-in live work must not disconnect just because Home was pressed.
+        // This keeps native sync running, but does not turn WebView into a push receiver.
+        if (!keepAliveEnabled) {
+            stopSyncRealtime()
+            syncHandler.removeCallbacks(syncRunnable)
+        }
     }
 
     /** Version code of the currently installed build. */
@@ -2376,7 +2390,7 @@ class MainActivity : AppCompatActivity() {
           syncAnonKey.isEmpty() || syncAnonKey.startsWith("%%"))
 
     private fun startSyncRealtime() {
-        if (!syncConfigured() || syncSocket != null) return
+        if (!shouldRunLiveSync() || !syncConfigured() || syncSocket != null) return
         try {
             val wsBase = syncSupabaseUrl.trimEnd('/').replace("https://", "wss://").replace("http://", "ws://")
             val encodedKey = URLEncoder.encode(syncAnonKey, "UTF-8")
@@ -2387,6 +2401,10 @@ class MainActivity : AppCompatActivity() {
                 .build()
             syncSocket = syncHttpClient.newWebSocket(request, object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: OkHttpResponse) {
+                    if (!shouldRunLiveSync()) {
+                        webSocket.close(1000, "inactive")
+                        return
+                    }
                     val ref = nextSyncRef()
                     webSocket.send("""{"topic":"realtime:public:app_sync_signals","event":"phx_join","payload":{"config":{"broadcast":{"self":false},"presence":{"key":""},"postgres_changes":[{"event":"INSERT","schema":"public","table":"app_sync_signals","filter":"project_id=eq.$syncProjectId"}]},"access_token":"$syncAnonKey"},"ref":"$ref"}""")
                     syncHandler.removeCallbacks(syncHeartbeatRunnable)
@@ -2402,14 +2420,21 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: OkHttpResponse?) {
-                    syncSocket = null
-                    syncHandler.removeCallbacks(syncHeartbeatRunnable)
-                    syncHandler.postDelayed({ startSyncRealtime() }, 5000L)
+                    syncHandler.post {
+                        if (syncSocket !== webSocket) return@post
+                        syncSocket = null
+                        syncHandler.removeCallbacks(syncHeartbeatRunnable)
+                        if (shouldRunLiveSync()) syncHandler.postDelayed({ startSyncRealtime() }, 5000L)
+                    }
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    syncSocket = null
-                    syncHandler.removeCallbacks(syncHeartbeatRunnable)
+                    syncHandler.post {
+                        if (syncSocket !== webSocket) return@post
+                        syncSocket = null
+                        syncHandler.removeCallbacks(syncHeartbeatRunnable)
+                        if (shouldRunLiveSync()) syncHandler.postDelayed({ startSyncRealtime() }, 5000L)
+                    }
                 }
             })
         } catch (_: Exception) {
@@ -2571,6 +2596,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        activityDestroyed = true
+        activityInForeground = false
+        stopSyncRealtime()
+        syncHandler.removeCallbacksAndMessages(null)
         try { setMediaCaptureActiveInternal(false) } catch (_: Exception) {}
         try { prewarmWebView?.destroy() } catch (_: Exception) {}
         prewarmWebView = null
