@@ -402,7 +402,7 @@ class MainActivity : AppCompatActivity() {
         // Prompt the user when a newer version of this app is live on Google Play.
         try { checkForPlayStoreUpdate() } catch (_: Throwable) {}
 
-        // %%KEEP_ALIVE_START%%
+        %%KEEP_ALIVE_START%%
     }
 
     /**
@@ -2575,7 +2575,7 @@ class MainActivity : AppCompatActivity() {
         try { prewarmWebView?.destroy() } catch (_: Exception) {}
         prewarmWebView = null
         try { appUpdateManager?.unregisterListener(appUpdateListener) } catch (_: Throwable) {}
-        // %%KEEP_ALIVE_STOP%%
+        %%KEEP_ALIVE_STOP%%
         super.onDestroy()
     }
 
