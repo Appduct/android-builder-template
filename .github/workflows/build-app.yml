@@ -237,6 +237,7 @@ jobs:
             sed -i "s|%%PULL_TO_REFRESH%%|${PULL_TO_REFRESH}|g" "$file"
             sed -i "s|%%BOTTOM_NAV%%|${BOTTOM_NAV}|g" "$file"
             sed -i "s|%%OFFLINE_MODE%%|${OFFLINE_MODE}|g" "$file"
+            sed -i "s|%%KEEP_ALIVE_ENABLED%%|${KEEP_ALIVE_ENABLED}|g" "$file"
             sed -i "s|%%DEVICE_NAVIGATION%%|${DEVICE_NAVIGATION}|g" "$file"
             sed -i "s|%%LANDING_ENABLED%%|${LANDING_ENABLED}|g" "$file"
             sed -i "s|%%LANDING_LAYOUT%%|${LANDING_LAYOUT}|g" "$file"
