@@ -206,7 +206,7 @@ jobs:
           if [ "$KEEP_ALIVE_ENABLED" = "true" ]; then
             KEEP_ALIVE_PERMISSIONS='<uses-permission android:name="android.permission.FOREGROUND_SERVICE" /><uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />'
             KEEP_ALIVE_SERVICE='<service android:name=".KeepAliveService" android:enabled="true" android:exported="false" android:foregroundServiceType="dataSync" />'
-            KEEP_ALIVE_START='try { val svc = Intent(this, KeepAliveService::class.java); if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) { startForegroundService(svc) } else { startService(svc) } } catch (_: Exception) {}'
+            KEEP_ALIVE_START='try { val svc = Intent(this, KeepAliveService::class.java); if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) { startForegroundService(svc) } else { startService(svc) } } catch (error: Exception) { android.util.Log.e("AppductKeepAlive", "Foreground live sync start rejected", error) }'
             KEEP_ALIVE_STOP='try { stopService(Intent(this, KeepAliveService::class.java)) } catch (_: Exception) {}'
           else
             KEEP_ALIVE_PERMISSIONS=''
