@@ -12,10 +12,10 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 
 /**
- * Tiny foreground service whose only job is to keep the app process alive while
- * the user is using the app — so things like ongoing audio, websockets, or
- * mid-form state survive being backgrounded (recent apps / Home button) and
- * the OS does not reclaim the process under memory pressure.
+ * Supports user-visible live sync while the activity is backgrounded.
+ * Does not guarantee process survival, bypass Doze, or deliver booking pushes.
+ * Android 15+ limits dataSync background service time; native FCM delivery is
+ * required for alerts after that limit or when the app process is unavailable.
  *
  * The notification is low-priority and silent so it never interrupts the user.
  */
@@ -32,12 +32,19 @@ class KeepAliveService : Service() {
             } else {
                 startForeground(NOTIF_ID, notif)
             }
-        } catch (_: Throwable) {
-            // If foreground promotion fails (e.g. missing permission), stop quietly —
-            // the activity will still run; we just lose the background-alive guarantee.
+        } catch (error: Throwable) {
+            android.util.Log.e("AppductKeepAlive", "Foreground live sync could not start", error)
             try { stopSelf() } catch (_: Throwable) {}
+            return START_NOT_STICKY
         }
         return START_STICKY
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        // Android 15+ requires dataSync services to stop promptly at their time limit.
+        android.util.Log.w("AppductKeepAlive", "Android background sync time limit reached; push alerts require FCM")
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     private fun ensureChannel() {
