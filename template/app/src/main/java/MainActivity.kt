@@ -317,7 +317,12 @@ class MainActivity : AppCompatActivity() {
         webView = findViewById(R.id.webView)
         // Keep-Alive apps keep the website awake while minimized (see KeepAwakeWebView).
         if (keepAliveEnabled) {
-            webView = installKeepAwakeWebView(webView)
+            // Keep the layout's own WebView (swapping it at runtime left the app blank and
+            // pushed the site to the browser). Minimized JS stays alive via resumeTimers().
+            try {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O)
+                    webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+            } catch (_: Throwable) {}
             // Background alerts need notification permission on Android 13+; ask once the
             // splash is gone so it doesn't collide with other launch permission prompts.
             syncHandler.postDelayed({ if (!activityDestroyed) ensureNotificationPermission() }, 4500L)
@@ -942,9 +947,12 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                if (!url.isNullOrBlank() && handleExternalUrl(url)) {
+                // Only non-web schemes are re-routed here; http(s) routing happens in
+                // shouldOverrideUrlLoading. Never blank the app's own website.
+                if (!url.isNullOrBlank() && !url.startsWith("http", ignoreCase = true) &&
+                    !url.startsWith("about:", ignoreCase = true) && handleExternalUrl(url)) {
                     try { view?.stopLoading() } catch (_: Exception) {}
-                    try { view?.loadUrl("about:blank") } catch (_: Exception) {}
+                    if (view?.canGoBack() == true) try { view.goBack() } catch (_: Exception) {}
                     return
                 }
                 progressBar.visibility = View.GONE
@@ -1386,6 +1394,8 @@ class MainActivity : AppCompatActivity() {
 
         // Per-app preference: when external links should open in the system browser,
         // any http(s) URL whose host differs from the wrapped website's host is sent out.
+        if (!forceExternal && (lower.startsWith("http://") || lower.startsWith("https://")) &&
+            !isExternalHost(url)) return false
         val isExternalHostHttp = !externalLinksInApp &&
             (lower.startsWith("http://") || lower.startsWith("https://")) &&
             isExternalHost(url)
@@ -2197,6 +2207,9 @@ class MainActivity : AppCompatActivity() {
         lastPauseTime = System.currentTimeMillis()
         if (keepAliveEnabled) KeepAliveService.setAppBackgrounded(true)
         setPageMinimized(true)
+        if (keepAliveEnabled && ::webView.isInitialized) {
+            try { webView.resumeTimers() } catch (_: Throwable) {}
+        }
         try { CookieManager.getInstance().flush() } catch (_: Exception) {}
         // Opted-in live work must not disconnect just because Home was pressed.
         // This keeps native sync running, but does not turn WebView into a push receiver.
@@ -2632,7 +2645,6 @@ class MainActivity : AppCompatActivity() {
         if (keepAliveEnabled) {
             KeepAliveService.observeState(null)
             KeepAliveService.setAppBackgrounded(false)
-            try { (webView as? KeepAwakeWebView)?.keepAwakeWhileHidden = false } catch (_: Throwable) {}
         }
         stopSyncRealtime()
         syncHandler.removeCallbacksAndMessages(null)
