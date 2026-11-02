@@ -315,6 +315,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView = findViewById(R.id.webView)
+        // Keep-Alive apps keep the website awake while minimized (see KeepAwakeWebView).
+        if (keepAliveEnabled) {
+            webView = installKeepAwakeWebView(webView)
+            // Background alerts need notification permission on Android 13+; ask once the
+            // splash is gone so it doesn't collide with other launch permission prompts.
+            syncHandler.postDelayed({ if (!activityDestroyed) ensureNotificationPermission() }, 4500L)
+        }
         swipeRefresh = findViewById(R.id.swipeRefresh)
         progressBar = findViewById(R.id.progressBar)
         errorView = findViewById(R.id.errorView)
@@ -948,6 +955,7 @@ class MainActivity : AppCompatActivity() {
                 injectBiometricLoginShim(view)
                 injectRealtimeCompletionShim(view)
                 injectMediaCaptureShim(view)
+                injectBackgroundAlertShim(view)
             }
             // First actual paint of the page — dismiss the splash here (load-aware) rather
             // than waiting for every sub-resource to finish downloading.
@@ -971,6 +979,7 @@ class MainActivity : AppCompatActivity() {
                 injectBiometricLoginShim(view)
                 injectRealtimeCompletionShim(view)
                 injectMediaCaptureShim(view)
+                injectBackgroundAlertShim(view)
                 try { CookieManager.getInstance().flush() } catch (_: Exception) {}
                 resetLandingRootHistoryIfNeeded(url)
                 dismissSplash()
@@ -2121,6 +2130,8 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             KeepAliveService.setAppBackgrounded(false)
+            setPageMinimized(false)
+            cancelBackgroundAlert()
             // Recover a service stopped by Android only while starting is permitted.
             %%KEEP_ALIVE_START%%
         }
@@ -2185,6 +2196,7 @@ class MainActivity : AppCompatActivity() {
         activityInForeground = false
         lastPauseTime = System.currentTimeMillis()
         if (keepAliveEnabled) KeepAliveService.setAppBackgrounded(true)
+        setPageMinimized(true)
         try { CookieManager.getInstance().flush() } catch (_: Exception) {}
         // Opted-in live work must not disconnect just because Home was pressed.
         // This keeps native sync running, but does not turn WebView into a push receiver.
@@ -2620,6 +2632,7 @@ class MainActivity : AppCompatActivity() {
         if (keepAliveEnabled) {
             KeepAliveService.observeState(null)
             KeepAliveService.setAppBackgrounded(false)
+            try { (webView as? KeepAwakeWebView)?.keepAwakeWhileHidden = false } catch (_: Throwable) {}
         }
         stopSyncRealtime()
         syncHandler.removeCallbacksAndMessages(null)
@@ -2728,6 +2741,17 @@ class MainActivity : AppCompatActivity() {
          * Reported by the injected media-capture shim whenever the page starts or stops using
          * the microphone/camera (WebRTC audio & video calls, recorders, screen share).
          */
+        /**
+         * Called by the background alert shim when the minimized page plays an alert sound
+         * (new ride request, order, chat). Shows a native heads-up notification instead.
+         */
+        @android.webkit.JavascriptInterface
+        fun showBackgroundAlert(title: String, body: String) {
+            runOnUiThread {
+                try { this@MainActivity.postBackgroundAlert(title, body) } catch (_: Exception) {}
+            }
+        }
+
         @android.webkit.JavascriptInterface
         fun setMediaCaptureActive(active: Boolean) {
             runOnUiThread {
@@ -2948,6 +2972,120 @@ class MainActivity : AppCompatActivity() {
      * This shim tracks live capture in the page and reports it to the native layer, and
      * always stops tracks before the page unloads so the mic is free for the next page.
      */
+    /**
+     * Keep-Alive only: replace the layout's WebView with a KeepAwakeWebView so Chromium keeps
+     * the page "visible" while minimized. Without this the page is hidden on Home press, its
+     * timers are throttled, and Supabase realtime refuses to reconnect a dropped socket while
+     * hidden ("Not reconnecting as page is hidden!") — new bookings then stop arriving until
+     * the app is reopened. The renderer is also kept important so Android does not freeze it.
+     */
+    private fun installKeepAwakeWebView(original: WebView): WebView {
+        return try {
+            val parent = original.parent as? android.view.ViewGroup ?: return original
+            val index = parent.indexOfChild(original)
+            val replacement = KeepAwakeWebView(this).apply {
+                id = original.id
+                layoutParams = original.layoutParams
+                visibility = original.visibility
+                keepAwakeWhileHidden = true
+            }
+            parent.removeViewAt(index)
+            parent.addView(replacement, index)
+            try { original.destroy() } catch (_: Throwable) {}
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                try {
+                    replacement.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+                } catch (_: Throwable) {}
+            }
+            replacement
+        } catch (_: Throwable) { original }
+    }
+
+    /** Tells the page whether the app is minimized so alert sounds become native notifications. */
+    private fun setPageMinimized(minimized: Boolean) {
+        if (!keepAliveEnabled || !::webView.isInitialized) return
+        try { webView.evaluateJavascript("window.__appductMinimized=$minimized;", null) } catch (_: Exception) {}
+    }
+
+    /**
+     * Keep-Alive only. While minimized: keeps document.visibilityState "visible" and swallows
+     * hidden visibilitychange events (so realtime clients never stop reconnecting), and turns
+     * an alert sound played by the page (e.g. a new ride request) into a native notification
+     * built from the newest on-screen toast text.
+     */
+    private fun injectBackgroundAlertShim(view: WebView?) {
+        if (!keepAliveEnabled) return
+        val minimized = !activityInForeground
+        val js = """
+            (function(){try{
+              window.__appductMinimized=$minimized;
+              if(window.__appductBgAlertShim)return;window.__appductBgAlertShim=1;
+              try{Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return 'visible'}});}catch(e){}
+              try{Object.defineProperty(document,'hidden',{configurable:true,get:function(){return false}});}catch(e){}
+              window.addEventListener('visibilitychange',function(e){if(window.__appductMinimized){e.stopImmediatePropagation();}},true);
+              function toastText(){try{var n=document.querySelectorAll('[data-sonner-toast],.Toastify__toast,[role="alert"],[role="status"]');for(var i=n.length-1;i>=0;i--){var t=(n[i].innerText||'').trim();if(t)return t.slice(0,400);}}catch(e){}return '';}
+              var last=0;
+              function raise(){try{if(!window.__appductMinimized)return;var now=Date.now();if(now-last<8000)return;last=now;var b=window.AndroidShareBridge;if(b&&b.showBackgroundAlert)b.showBackgroundAlert(document.title||'',toastText());}catch(e){}}
+              var op=HTMLMediaElement.prototype.play;
+              HTMLMediaElement.prototype.play=function(){try{if(window.__appductMinimized){var d=this.duration;if(!(d>45))setTimeout(raise,400);}}catch(e){}return op.apply(this,arguments);};
+            }catch(e){}})();
+        """.trimIndent()
+        try { view?.evaluateJavascript(js, null) } catch (_: Exception) {}
+    }
+
+    private val backgroundAlertId = 7300
+
+    private fun postBackgroundAlert(pageTitle: String, toast: String) {
+        if (!keepAliveEnabled || activityInForeground || activityDestroyed) return
+        try {
+            val appName = applicationInfo.loadLabel(packageManager).toString()
+            val ignored = setOf("view", "close", "dismiss", "ok", "x")
+            val lines = toast.lines().map { it.trim() }
+                .filter { it.length > 1 && it.lowercase() !in ignored }
+            val title = lines.firstOrNull() ?: "New activity in $appName"
+            val body = if (lines.size > 1) lines.drop(1).joinToString(" ").take(240)
+                else "Tap to open $appName."
+            val mgr = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+                mgr.getNotificationChannel("appduct_live_alerts") == null
+            ) {
+                mgr.createNotificationChannel(
+                    android.app.NotificationChannel(
+                        "appduct_live_alerts",
+                        "Live alerts",
+                        android.app.NotificationManager.IMPORTANCE_HIGH
+                    ).apply {
+                        description = "New requests and messages received while the app is minimized."
+                        enableVibration(true)
+                    }
+                )
+            }
+            val open = Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            val flags = android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+            val pi = android.app.PendingIntent.getActivity(this, backgroundAlertId, open, flags)
+            val notif = androidx.core.app.NotificationCompat.Builder(this, "appduct_live_alerts")
+                .setSmallIcon(applicationInfo.icon)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(body))
+                .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+                .setCategory(androidx.core.app.NotificationCompat.CATEGORY_EVENT)
+                .setVisibility(androidx.core.app.NotificationCompat.VISIBILITY_PUBLIC)
+                .setDefaults(androidx.core.app.NotificationCompat.DEFAULT_VIBRATE)
+                .setAutoCancel(true)
+                .setContentIntent(pi)
+                .build()
+            mgr.notify(backgroundAlertId, notif)
+        } catch (_: Throwable) {}
+    }
+
+    private fun cancelBackgroundAlert() {
+        try {
+            (getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager).cancel(backgroundAlertId)
+        } catch (_: Throwable) {}
+    }
+
     private fun injectMediaCaptureShim(view: WebView?) {
         val js = """
             (function(){try{
@@ -3518,3 +3656,20 @@ class MainActivity : AppCompatActivity() {
     }
 }
 
+/**
+ * WebView used by Keep-Alive apps. When the activity is minimized Android reports the window
+ * as hidden, which makes Chromium hide the page, throttle its timers and let realtime clients
+ * give up reconnecting. While [keepAwakeWhileHidden] is set, hidden window visibility is
+ * reported as visible so the wrapped site keeps receiving live updates in the background.
+ */
+class KeepAwakeWebView(context: android.content.Context) : WebView(context) {
+    @Volatile var keepAwakeWhileHidden: Boolean = false
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        if (keepAwakeWhileHidden && visibility != View.VISIBLE) {
+            super.onWindowVisibilityChanged(View.VISIBLE)
+            return
+        }
+        super.onWindowVisibilityChanged(visibility)
+    }
+}
