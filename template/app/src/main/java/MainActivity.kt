@@ -424,6 +424,46 @@ class MainActivity : AppCompatActivity() {
         try { checkForPlayStoreUpdate() } catch (_: Throwable) {}
 
         %%KEEP_ALIVE_START%%
+
+        // Native push alerts (only compiled in when the app has a Firebase config).
+        if (pushEnabled) {
+            %%PUSH_INIT%%
+            try { getSharedPreferences("appduct_push", MODE_PRIVATE).registerOnSharedPreferenceChangeListener(pushTokenListener) } catch (_: Throwable) {}
+        }
+        handlePushIntent(intent)
+    }
+
+    // ---- Native push alerts -----------------------------------------------------
+    private val pushEnabled = "%%PUSH_ENABLED%%" == "true"
+
+    private val pushTokenListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == "token") runOnUiThread { dispatchPushTokenToPage() }
+    }
+
+    private fun currentPushToken(): String =
+        if (!pushEnabled) "" else (getSharedPreferences("appduct_push", MODE_PRIVATE).getString("token", "") ?: "")
+
+    /** Tell the website about this phone's push token so it can store it for the signed-in user. */
+    private fun dispatchPushTokenToPage() {
+        val token = currentPushToken()
+        if (token.isBlank() || !::webView.isInitialized) return
+        val safe = org.json.JSONObject.quote(token)
+        val js = "(function(){try{window.__appductPushToken=$safe;window.dispatchEvent(new CustomEvent('appduct:push-token',{detail:{token:$safe,platform:'android'}}));}catch(e){}})();"
+        try { webView.evaluateJavascript(js, null) } catch (_: Throwable) {}
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handlePushIntent(intent)
+    }
+
+    /** Open the page a tapped push alert points to, but only if it belongs to this app's site. */
+    private fun handlePushIntent(intent: Intent?) {
+        val url = intent?.getStringExtra("appduct_push_url") ?: intent?.getStringExtra("url") ?: return
+        if (!url.startsWith("http") || isExternalHost(url) || !::webView.isInitialized) return
+        intent.removeExtra("appduct_push_url"); intent.removeExtra("url")
+        try { webView.loadUrl(url) } catch (_: Throwable) {}
     }
 
     /**
@@ -988,6 +1028,7 @@ class MainActivity : AppCompatActivity() {
                 injectRealtimeCompletionShim(view)
                 injectMediaCaptureShim(view)
                 injectBackgroundAlertShim(view)
+                dispatchPushTokenToPage()
                 try { CookieManager.getInstance().flush() } catch (_: Exception) {}
                 resetLandingRootHistoryIfNeeded(url)
                 dismissSplash()
@@ -2763,6 +2804,13 @@ class MainActivity : AppCompatActivity() {
                 try { this@MainActivity.postBackgroundAlert(title, body) } catch (_: Exception) {}
             }
         }
+
+        /** This phone's native push token ("" until Firebase issues one or when push isn't built in). */
+        @android.webkit.JavascriptInterface
+        fun getPushToken(): String = this@MainActivity.currentPushToken()
+
+        @android.webkit.JavascriptInterface
+        fun isPushSupported(): Boolean = this@MainActivity.pushEnabled
 
         @android.webkit.JavascriptInterface
         fun setMediaCaptureActive(active: Boolean) {
