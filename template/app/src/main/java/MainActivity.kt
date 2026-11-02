@@ -462,7 +462,7 @@ class MainActivity : AppCompatActivity() {
     private fun handlePushIntent(intent: Intent?) {
         val url = intent?.getStringExtra("appduct_push_url") ?: intent?.getStringExtra("url") ?: return
         if (!url.startsWith("http") || isExternalHost(url) || !::webView.isInitialized) return
-        intent.removeExtra("appduct_push_url"); intent.removeExtra("url")
+        intent?.removeExtra("appduct_push_url"); intent?.removeExtra("url")
         try { webView.loadUrl(url) } catch (_: Throwable) {}
     }
 
