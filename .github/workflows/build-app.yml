@@ -109,7 +109,7 @@ jobs:
     steps:
       - name: Mask private build inputs
         run: |
-          # Inputs are read from the event file (never via env/${{ }}) so signing keys and
+          # Inputs are read from the event file (never via step env or inline expressions) so signing keys and
           # passwords are not echoed into public step headers; mask them for every later step.
           EV="$GITHUB_EVENT_PATH"
           for KEY in sync_config_json signing_config_json; do
