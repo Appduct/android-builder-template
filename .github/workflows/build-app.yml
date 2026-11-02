@@ -217,8 +217,28 @@ jobs:
 
 
           
+          # Native push alerts (FCM): enabled only when a Firebase Android config for this package was supplied.
+          FCM_API_KEY="$(jq_get "$SC" '.push_config.api_key')"
+          FCM_APP_ID="$(jq_get "$SC" '.push_config.app_id')"
+          FCM_PROJECT_ID="$(jq_get "$SC" '.push_config.project_id')"
+          FCM_SENDER_ID="$(jq_get "$SC" '.push_config.sender_id')"
+          if [ -n "$FCM_API_KEY" ] && [ -n "$FCM_APP_ID" ] && [ -n "$FCM_PROJECT_ID" ] && [ -n "$FCM_SENDER_ID" ]; then
+            PUSH_ENABLED="true"
+            PUSH_SERVICE='<service android:name=".AppductMessagingService" android:exported="false"><intent-filter><action android:name="com.google.firebase.MESSAGING_EVENT" /></intent-filter></service><meta-data android:name="com.google.firebase.messaging.default_notification_channel_id" android:value="appduct_alerts" />'
+            PUSH_INIT='try { AppductMessagingService.initialize(this) } catch (error: Throwable) { android.util.Log.e("AppductPush", "Push setup failed", error) }'
+            echo "🔔 Native push alerts enabled (Firebase project $FCM_PROJECT_ID)"
+          else
+            PUSH_ENABLED="false"; PUSH_SERVICE=''; PUSH_INIT=''
+            echo "ℹ️ No Firebase Android config for this app; native push alerts not included"
+          fi
+
           # Copy template
           cp -r template/* build-output/
+          if [ "$PUSH_ENABLED" = "true" ]; then
+            printf "\ndependencies {\n    implementation platform('com.google.firebase:firebase-bom:33.5.1')\n    implementation 'com.google.firebase:firebase-messaging'\n}\n" >> build-output/app/build.gradle
+          else
+            rm -f build-output/app/src/main/java/AppductMessagingService.kt
+          fi
           
           # Replace placeholders in all files
           find build-output -type f \( -name "*.gradle" -o -name "*.xml" -o -name "*.kt" -o -name "*.properties" \) | while read file; do
@@ -253,6 +273,12 @@ jobs:
             sed -i "s|%%ADMOB_APP_OPEN_ENABLED%%|${ADMOB_APP_OPEN_ENABLED}|g" "$file"
             sed -i "s|%%ADMOB_APP_OPEN_ID%%|${ADMOB_APP_OPEN_ID}|g" "$file"
             sed -i "s|%%ADMOB_INTERSTITIAL_INTERVAL%%|${ADMOB_INTERSTITIAL_INTERVAL}|g" "$file"
+            sed -i "s|%%PUSH_ENABLED%%|${PUSH_ENABLED}|g" "$file"
+            sed -i "s|%%FCM_API_KEY%%|${FCM_API_KEY}|g" "$file"
+            sed -i "s|%%FCM_APP_ID%%|${FCM_APP_ID}|g" "$file"
+            sed -i "s|%%FCM_PROJECT_ID%%|${FCM_PROJECT_ID}|g" "$file"
+            sed -i "s|%%FCM_SENDER_ID%%|${FCM_SENDER_ID}|g" "$file"
+            PUSH_SERVICE="$PUSH_SERVICE" PUSH_INIT="$PUSH_INIT" python3 -c "import sys,os; p=sys.argv[1]; s=open(p,encoding='utf-8',errors='ignore').read(); s=s.replace('%%PUSH_SERVICE%%', os.environ.get('PUSH_SERVICE','')); s=s.replace('%%PUSH_INIT%%', os.environ.get('PUSH_INIT','')); open(p,'w',encoding='utf-8').write(s)" "$file"
             # Use python for safer replacement of the keep-alive blocks (avoid sed delimiter issues with quotes/angles)
             KEEP_ALIVE_PERMISSIONS="$KEEP_ALIVE_PERMISSIONS" KEEP_ALIVE_SERVICE="$KEEP_ALIVE_SERVICE" KEEP_ALIVE_START="$KEEP_ALIVE_START" KEEP_ALIVE_STOP="$KEEP_ALIVE_STOP" python3 -c "import sys,os; p=sys.argv[1]; s=open(p,encoding='utf-8',errors='ignore').read(); s=s.replace('%%KEEP_ALIVE_PERMISSIONS%%', os.environ.get('KEEP_ALIVE_PERMISSIONS','')); s=s.replace('%%KEEP_ALIVE_SERVICE%%', os.environ.get('KEEP_ALIVE_SERVICE','')); s=s.replace('%%KEEP_ALIVE_START%%', os.environ.get('KEEP_ALIVE_START','')); s=s.replace('%%KEEP_ALIVE_STOP%%', os.environ.get('KEEP_ALIVE_STOP','')); open(p,'w',encoding='utf-8').write(s)" "$file"
           done
@@ -260,6 +286,9 @@ jobs:
           # Move source files to correct package directory
           mkdir -p "build-output/app/src/main/java/${PACKAGE_PATH}"
           mv build-output/app/src/main/java/MainActivity.kt "build-output/app/src/main/java/${PACKAGE_PATH}/MainActivity.kt"
+          if [ -f build-output/app/src/main/java/AppductMessagingService.kt ]; then
+            mv build-output/app/src/main/java/AppductMessagingService.kt "build-output/app/src/main/java/${PACKAGE_PATH}/AppductMessagingService.kt"
+          fi
           if [ -f build-output/app/src/main/java/KeepAliveService.kt ]; then
             mv build-output/app/src/main/java/KeepAliveService.kt "build-output/app/src/main/java/${PACKAGE_PATH}/KeepAliveService.kt"
           fi
