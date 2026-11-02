@@ -107,6 +107,20 @@ jobs:
       cancel-in-progress: true
 
     steps:
+      - name: Mask private build inputs
+        run: |
+          # Inputs are read from the event file (never via env/${{ }}) so signing keys and
+          # passwords are not echoed into public step headers; mask them for every later step.
+          EV="$GITHUB_EVENT_PATH"
+          for KEY in sync_config_json signing_config_json; do
+            RAW="$(jq -r --arg k "$KEY" '.inputs[$k] // ""' "$EV" 2>/dev/null || true)"
+            [ -z "$RAW" ] && continue
+            echo "::add-mask::$RAW"
+            for F in '.signing_config.keystore_b64' '.signing_config.store_password' '.signing_config.key_password' '.keystore_b64' '.store_password' '.key_password'; do
+              V="$(printf '%s' "$RAW" | jq -r "$F // empty" 2>/dev/null || true)"
+              [ -n "$V" ] && echo "::add-mask::$V"
+            done
+          done
       - name: Checkout template
         uses: actions/checkout@v4
 
@@ -156,8 +170,8 @@ jobs:
       - name: Generate Android project
         env:
           EXTRA_FEATURES_JSON: ${{ inputs.extra_features_json }}
-          SYNC_CONFIG_JSON: ${{ inputs.sync_config_json }}
         run: |
+          SYNC_CONFIG_JSON="$(jq -r '.inputs.sync_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
           mkdir -p build-output
           command -v jq >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
 
@@ -481,11 +495,10 @@ jobs:
 
 
       - name: Setup signing
-        env:
-          SIGNING_CONFIG_JSON: ${{ inputs.signing_config_json }}
-          SYNC_CONFIG_JSON: ${{ inputs.sync_config_json }}
         run: |
           set -e
+          SIGNING_CONFIG_JSON="$(jq -r '.inputs.signing_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+          SYNC_CONFIG_JSON="$(jq -r '.inputs.sync_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
           command -v jq >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
           SC="${SIGNING_CONFIG_JSON:-}"
           if [ -z "$SC" ] || [ "$SC" = "{}" ]; then
