@@ -318,18 +318,13 @@ class MainActivity : AppCompatActivity() {
         // Keep-Alive apps keep the website awake while minimized (see KeepAwakeWebView).
         if (keepAliveEnabled) {
             // Keep the layout's own WebView (swapping it at runtime left the app blank and
-            // pushed the site to the browser). The layout inflates KeepAwakeWebView, so the
-            // page stays "visible" to Chromium while minimized; timers stay resumed too.
-            (webView as? KeepAwakeWebView)?.keepAwakeWhileHidden = true
+            // pushed the site to the browser). Minimized JS stays alive via resumeTimers().
             try {
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O)
                     webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
             } catch (_: Throwable) {}
-            // Many phones (Tecno, Infinix, Xiaomi, Samsung...) freeze or kill minimized apps
-            // under battery optimization even with a foreground service; ask once to lift it.
-            syncHandler.postDelayed({ if (!activityDestroyed) ensureBatteryExemption() }, 9000L)
-        }
-        if (keepAliveEnabled || pushEnabled) {
+            // Background alerts need notification permission on Android 13+; ask once the
+            // splash is gone so it doesn't collide with other launch permission prompts.
             syncHandler.postDelayed({ if (!activityDestroyed) ensureNotificationPermission() }, 4500L)
         }
         swipeRefresh = findViewById(R.id.swipeRefresh)
@@ -2274,38 +2269,6 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Throwable) { 0L }
     }
 
-    /**
-     * Keep-Alive only, asked once: battery optimization lets Android/OEM battery managers
-     * suspend a minimized app's network even while its foreground service runs. Opens the
-     * system battery-optimization list (no special permission) after a short explanation.
-     */
-    private fun ensureBatteryExemption() {
-        try {
-            if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.M) return
-            val pm = getSystemService(POWER_SERVICE) as android.os.PowerManager
-            if (pm.isIgnoringBatteryOptimizations(packageName)) return
-            val prefs = getSharedPreferences("appduct_keepalive", MODE_PRIVATE)
-            if (prefs.getBoolean("battery_prompt_shown", false)) return
-            prefs.edit().putBoolean("battery_prompt_shown", true).apply()
-            val appName = applicationInfo.loadLabel(packageManager).toString()
-            android.app.AlertDialog.Builder(this)
-                .setTitle("Stay ready in the background")
-                .setMessage("To keep receiving live updates when $appName is minimized, set its battery usage to \"Unrestricted\" / \"Don't optimize\" on the next screen.")
-                .setPositiveButton("Open settings") { _, _ ->
-                    try {
-                        startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-                    } catch (_: Throwable) {
-                        try {
-                            startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                android.net.Uri.parse("package:$packageName")))
-                        } catch (_: Throwable) {}
-                    }
-                }
-                .setNegativeButton("Not now", null)
-                .show()
-        } catch (_: Throwable) {}
-    }
-
     private fun ensureNotificationPermission() {
         try {
             if (android.os.Build.VERSION.SDK_INT >= 33 &&
@@ -3069,6 +3032,35 @@ class MainActivity : AppCompatActivity() {
      * This shim tracks live capture in the page and reports it to the native layer, and
      * always stops tracks before the page unloads so the mic is free for the next page.
      */
+    /**
+     * Keep-Alive only: replace the layout's WebView with a KeepAwakeWebView so Chromium keeps
+     * the page "visible" while minimized. Without this the page is hidden on Home press, its
+     * timers are throttled, and Supabase realtime refuses to reconnect a dropped socket while
+     * hidden ("Not reconnecting as page is hidden!") — new bookings then stop arriving until
+     * the app is reopened. The renderer is also kept important so Android does not freeze it.
+     */
+    private fun installKeepAwakeWebView(original: WebView): WebView {
+        return try {
+            val parent = original.parent as? android.view.ViewGroup ?: return original
+            val index = parent.indexOfChild(original)
+            val replacement = KeepAwakeWebView(this).apply {
+                id = original.id
+                layoutParams = original.layoutParams
+                visibility = original.visibility
+                keepAwakeWhileHidden = true
+            }
+            parent.removeViewAt(index)
+            parent.addView(replacement, index)
+            try { original.destroy() } catch (_: Throwable) {}
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                try {
+                    replacement.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+                } catch (_: Throwable) {}
+            }
+            replacement
+        } catch (_: Throwable) { original }
+    }
+
     /** Tells the page whether the app is minimized so alert sounds become native notifications. */
     private fun setPageMinimized(minimized: Boolean) {
         if (!keepAliveEnabled || !::webView.isInitialized) return
@@ -3725,20 +3717,12 @@ class MainActivity : AppCompatActivity() {
 }
 
 /**
- * The app's WebView, inflated straight from activity_main.xml (never swapped at runtime, so the
- * WebViewClient and settings configured in onCreate always apply). For Keep-Alive apps
- * [keepAwakeWhileHidden] is switched on: when the activity is minimized or the screen locks,
- * Android hides the window/decor view, which makes Chromium mark the page hidden, throttle its
- * timers (down to once a minute) and let realtime sockets miss heartbeats and drop. While the
- * flag is set those system-driven hides are reported to Chromium as visible, so the wrapped
- * site keeps its live connection running. Visibility changes made on the WebView itself
- * (fullscreen video, offline screen) still pass through unchanged.
+ * WebView used by Keep-Alive apps. When the activity is minimized Android reports the window
+ * as hidden, which makes Chromium hide the page, throttle its timers and let realtime clients
+ * give up reconnecting. While [keepAwakeWhileHidden] is set, hidden window visibility is
+ * reported as visible so the wrapped site keeps receiving live updates in the background.
  */
-class KeepAwakeWebView @JvmOverloads constructor(
-    context: android.content.Context,
-    attrs: android.util.AttributeSet? = null,
-    defStyleAttr: Int = android.R.attr.webViewStyle
-) : WebView(context, attrs, defStyleAttr) {
+class KeepAwakeWebView(context: android.content.Context) : WebView(context) {
     @Volatile var keepAwakeWhileHidden: Boolean = false
 
     override fun onWindowVisibilityChanged(visibility: Int) {
@@ -3747,13 +3731,5 @@ class KeepAwakeWebView @JvmOverloads constructor(
             return
         }
         super.onWindowVisibilityChanged(visibility)
-    }
-
-    override fun onVisibilityChanged(changedView: View, visibility: Int) {
-        if (keepAwakeWhileHidden && changedView !== this && visibility != View.VISIBLE) {
-            super.onVisibilityChanged(changedView, View.VISIBLE)
-            return
-        }
-        super.onVisibilityChanged(changedView, visibility)
     }
 }
