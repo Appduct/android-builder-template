@@ -107,6 +107,27 @@ jobs:
       cancel-in-progress: true
 
     steps:
+      - name: Mask private build inputs
+        run: |
+          # Inputs are read from the event file (never via step env or inline expressions) so signing keys and
+          # passwords are not echoed into public step headers; mask them for every later step.
+          set +e
+          EV="$GITHUB_EVENT_PATH"
+          if [ -f "$EV" ]; then
+            for KEY in sync_config_json signing_config_json; do
+              RAW="$(jq -r --arg k "$KEY" '.inputs[$k] // ""' "$EV" 2>/dev/null || true)"
+              if [ -n "$RAW" ] && [ "$RAW" != "{}" ]; then
+                echo "::add-mask::$RAW"
+                for F in '.signing_config.keystore_b64' '.signing_config.store_password' '.signing_config.key_password' '.keystore_b64' '.store_password' '.key_password'; do
+                  V="$(printf '%s' "$RAW" | jq -r "$F // empty" 2>/dev/null || true)"
+                  if [ -n "$V" ]; then
+                    echo "::add-mask::$V"
+                  fi
+                done
+              fi
+            done
+          fi
+          exit 0
       - name: Checkout template
         uses: actions/checkout@v4
 
@@ -127,7 +148,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.5'
+          gradle-version: '8.9'
           cache-read-only: false
           # Reuse one warm dependency cache across every app build.
           gradle-home-cache-cleanup: true
@@ -145,19 +166,20 @@ jobs:
           BUILD_ID: ${{ inputs.build_id }}
           BUILD_WEBHOOK_SECRET: ${{ secrets.BUILD_WEBHOOK_SECRET }}
         run: |
+          WEBHOOK_SECRET="${BUILD_WEBHOOK_SECRET:-$(jq -r '.inputs.sync_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null | jq -r '.webhook_secret // ""' 2>/dev/null || true)}"
           bash scripts/post_callback.sh \
             "$CALLBACK_URL" \
             "$BUILD_ID" \
             "processing" \
             "" \
             "GitHub Actions build started on runner ${{ runner.os }}" \
-            "$BUILD_WEBHOOK_SECRET" || true
+            "$WEBHOOK_SECRET" || true
 
       - name: Generate Android project
         env:
           EXTRA_FEATURES_JSON: ${{ inputs.extra_features_json }}
-          SYNC_CONFIG_JSON: ${{ inputs.sync_config_json }}
         run: |
+          SYNC_CONFIG_JSON="$(jq -r '.inputs.sync_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
           mkdir -p build-output
           command -v jq >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
 
@@ -196,6 +218,7 @@ jobs:
           KEEP_ALIVE_ENABLED="$(jq_get "$EF" '.keep_alive_enabled')"; [ -z "$KEEP_ALIVE_ENABLED" ] && KEEP_ALIVE_ENABLED="false"
           EXTERNAL_LINKS_IN_APP="$(jq_get "$EF" '.external_links_in_app')"; [ -z "$EXTERNAL_LINKS_IN_APP" ] && EXTERNAL_LINKS_IN_APP="true"
           BIOMETRIC_ENABLED="$(jq_get "$EF" '.biometric_login')"; [ -z "$BIOMETRIC_ENABLED" ] && BIOMETRIC_ENABLED="false"
+          BATTERY_OPTIMIZATION="$(jq_get "$EF" '.battery_optimization')"; [ -z "$BATTERY_OPTIMIZATION" ] && BATTERY_OPTIMIZATION="false"
           ADMOB_APP_OPEN_ENABLED="$(jq_get "$EF" '.admob_app_open_enabled')"; [ -z "$ADMOB_APP_OPEN_ENABLED" ] && ADMOB_APP_OPEN_ENABLED="false"
           ADMOB_APP_OPEN_ID="$(jq_get "$EF" '.admob_app_open_id')"; [ -z "$ADMOB_APP_OPEN_ID" ] && ADMOB_APP_OPEN_ID="none"
           ADMOB_INTERSTITIAL_INTERVAL="$(jq_get "$EF" '.admob_interstitial_interval')"; [ -z "$ADMOB_INTERSTITIAL_INTERVAL" ] && ADMOB_INTERSTITIAL_INTERVAL="3"
@@ -258,6 +281,7 @@ jobs:
             sed -i "s|%%BOTTOM_NAV%%|${BOTTOM_NAV}|g" "$file"
             sed -i "s|%%OFFLINE_MODE%%|${OFFLINE_MODE}|g" "$file"
             sed -i "s|%%KEEP_ALIVE_ENABLED%%|${KEEP_ALIVE_ENABLED}|g" "$file"
+            sed -i "s|%%BATTERY_OPTIMIZATION%%|${BATTERY_OPTIMIZATION}|g" "$file"
             sed -i "s|%%DEVICE_NAVIGATION%%|${DEVICE_NAVIGATION}|g" "$file"
             sed -i "s|%%LANDING_ENABLED%%|${LANDING_ENABLED}|g" "$file"
             sed -i "s|%%LANDING_LAYOUT%%|${LANDING_LAYOUT}|g" "$file"
@@ -291,6 +315,9 @@ jobs:
           fi
           if [ -f build-output/app/src/main/java/KeepAliveService.kt ]; then
             mv build-output/app/src/main/java/KeepAliveService.kt "build-output/app/src/main/java/${PACKAGE_PATH}/KeepAliveService.kt"
+          fi
+          if [ -f build-output/app/src/main/java/LandingAdapter.kt ]; then
+            mv build-output/app/src/main/java/LandingAdapter.kt "build-output/app/src/main/java/${PACKAGE_PATH}/LandingAdapter.kt"
           fi
 
       - name: Verify AdMob injection
@@ -364,7 +391,7 @@ jobs:
         working-directory: build-output
         run: |
           if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
-            gradle wrapper --gradle-version 8.5 --no-daemon
+            gradle wrapper --gradle-version 8.9 --no-daemon
           fi
 
       - name: Install image tools
@@ -424,7 +451,7 @@ jobs:
           
           if [ -n "$SPLASH_URL" ] && [ "$SPLASH_URL" != "" ]; then
             echo "Downloading splash image from $SPLASH_URL"
-            curl -sL "$SPLASH_URL" -o /tmp/splash_original.png
+            curl -sL --max-time 30 "$SPLASH_URL" -o /tmp/splash_original.png || true
             if [ -f /tmp/splash_original.png ] && [ -s /tmp/splash_original.png ]; then
               convert /tmp/splash_original.png -resize 1080x1920 "${DRAWABLE_DIR}/splash_image.png"
               echo "Splash image downloaded and resized"
@@ -481,11 +508,10 @@ jobs:
 
 
       - name: Setup signing
-        env:
-          SIGNING_CONFIG_JSON: ${{ inputs.signing_config_json }}
-          SYNC_CONFIG_JSON: ${{ inputs.sync_config_json }}
         run: |
           set -e
+          SIGNING_CONFIG_JSON="$(jq -r '.inputs.signing_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+          SYNC_CONFIG_JSON="$(jq -r '.inputs.sync_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
           command -v jq >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
           SC="${SIGNING_CONFIG_JSON:-}"
           if [ -z "$SC" ] || [ "$SC" = "{}" ]; then
@@ -532,7 +558,7 @@ jobs:
         run: |
           set -o pipefail
           timeout --signal=TERM --kill-after=60s 25m \
-            ./gradlew assembleRelease bundleRelease --no-daemon --parallel --build-cache --configure-on-demand --max-workers=4 2>&1 | tee build.log
+            ./gradlew assembleRelease bundleRelease --no-daemon --build-cache --max-workers=2 2>&1 | tee build.log
           result=${PIPESTATUS[0]}
           if [ "$result" -eq 124 ]; then
             echo "Build stopped after the 25-minute safety limit." | tee -a build.log
@@ -555,7 +581,7 @@ jobs:
             response_file=$(mktemp)
 
             local http_status
-            http_status=$(curl -sS -o "$response_file" -w "%{http_code}" -X POST "${SUPABASE_URL}/storage/v1/object/app-assets/${object_path}" \
+            http_status=$(curl -sS --retry 3 --retry-delay 2 --retry-all-errors --max-time 180 --connect-timeout 20 -o "$response_file" -w "%{http_code}" -X POST "${SUPABASE_URL}/storage/v1/object/app-assets/${object_path}" \
               -H "Authorization: Bearer ${SERVICE_KEY}" \
               -H "x-upsert: true" \
               -H "Content-Type: ${content_type}" \
@@ -621,6 +647,7 @@ jobs:
           AAB_URL: ${{ steps.upload.outputs.aab_url }}
           BUILD_WEBHOOK_SECRET: ${{ secrets.BUILD_WEBHOOK_SECRET }}
         run: |
+          WEBHOOK_SECRET="${BUILD_WEBHOOK_SECRET:-$(jq -r '.inputs.sync_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null | jq -r '.webhook_secret // ""' 2>/dev/null || true)}"
           APK_CALLBACK_URL="${APK_URL:-N/A}"
           AAB_CALLBACK_URL="${AAB_URL:-N/A}"
           bash scripts/post_callback.sh \
@@ -629,21 +656,50 @@ jobs:
             "completed" \
             "$DOWNLOAD_URL" \
             "Build completed successfully. APK: ${APK_CALLBACK_URL}, AAB: ${AAB_CALLBACK_URL}" \
-            "$BUILD_WEBHOOK_SECRET"
+            "$WEBHOOK_SECRET"
 
       - name: Notify build failed
-        if: failure()
+        if: failure() || cancelled()
         env:
           CALLBACK_URL: ${{ inputs.callback_url }}
           BUILD_ID: ${{ inputs.build_id }}
           BUILD_WEBHOOK_SECRET: ${{ secrets.BUILD_WEBHOOK_SECRET }}
         run: |
-          LOGS=$(tail -50 build-output/build.log 2>/dev/null || echo "No logs available")
-          bash scripts/post_callback.sh \
-            "$CALLBACK_URL" \
-            "$BUILD_ID" \
-            "failed" \
-            "" \
-            "Build failed. Last 50 lines: ${LOGS}" \
-            "$BUILD_WEBHOOK_SECRET" || true
+          WEBHOOK_SECRET="${BUILD_WEBHOOK_SECRET:-$(jq -r '.inputs.sync_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null | jq -r '.webhook_secret // ""' 2>/dev/null || true)}"
+          LOGS=""
+          if [ -f build-output/build.log ]; then
+            LOGS="$(tail -50 build-output/build.log 2>/dev/null || true)"
+          elif [ -f /tmp/icon_convert_error.log ]; then
+            LOGS="$(cat /tmp/icon_convert_error.log 2>/dev/null || true)"
+          fi
+          if [ -z "$LOGS" ]; then
+            LOGS="Build failed before or during compilation (check runner steps)"
+          fi
+          if [ -f scripts/post_callback.sh ]; then
+            bash scripts/post_callback.sh \
+              "$CALLBACK_URL" \
+              "$BUILD_ID" \
+              "failed" \
+              "" \
+              "Build failed. Last lines: ${LOGS}" \
+              "$WEBHOOK_SECRET" || true
+          else
+            PAYLOAD_FILE="$(mktemp)"
+            python3 - "$BUILD_ID" "failed" "" "Build failed. Last lines: ${LOGS}" "$WEBHOOK_SECRET" <<'PY' > "$PAYLOAD_FILE"
+import json
+import sys
+raw_args = sys.argv[1:] + ["", "", "", "", ""]
+b_id, status, d_url, logs, secret = raw_args[:5]
+body = { "build_id": b_id, "status": status }
+if d_url: body["download_url"] = d_url
+if logs: body["logs"] = logs
+if secret: body["secret"] = secret
+json.dump(body, sys.stdout)
+PY
+            curl -sS --retry 3 --retry-delay 2 --retry-all-errors --max-time 30 \
+              -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              --data-binary @"$PAYLOAD_FILE" || true
+            rm -f "$PAYLOAD_FILE"
+          fi
 
