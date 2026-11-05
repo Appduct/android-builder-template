@@ -20,7 +20,8 @@ python3 - "$build_id" "$status" "$download_url" "$logs" "$secret" <<'PY' > "$pay
 import json
 import sys
 
-build_id, status, download_url, logs, secret = sys.argv[1:6]
+raw_args = sys.argv[1:] + ["", "", "", "", ""]
+build_id, status, download_url, logs, secret = raw_args[:5]
 body = {
     "build_id": build_id,
     "status": status,
