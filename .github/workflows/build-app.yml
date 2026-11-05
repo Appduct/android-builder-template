@@ -181,7 +181,7 @@ jobs:
         run: |
           SYNC_CONFIG_JSON="$(jq -r '.inputs.sync_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
           mkdir -p build-output
-          command -v jq >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
+          command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
 
           # Parse consolidated JSON blobs (GitHub workflow_dispatch has a 25-input limit)
           EF="${EXTRA_FEATURES_JSON:-{}}"
@@ -447,7 +447,7 @@ jobs:
           DRAWABLE_DIR="build-output/app/src/main/res/drawable"
           mkdir -p "$DRAWABLE_DIR"
           
-          command -v convert >/dev/null 2>&1 || command -v convert >/dev/null 2>&1 || sudo apt-get install -y imagemagick > /dev/null 2>&1 || true
+          command -v convert >/dev/null 2>&1 || sudo apt-get install -y imagemagick > /dev/null 2>&1 || true
           
           if [ -n "$SPLASH_URL" ] && [ "$SPLASH_URL" != "" ]; then
             echo "Downloading splash image from $SPLASH_URL"
@@ -479,7 +479,7 @@ jobs:
           ASSETS_DIR="build-output/app/src/main/assets"
           DRAWABLE_DIR="build-output/app/src/main/res/drawable"
           mkdir -p "$ASSETS_DIR" "$DRAWABLE_DIR"
-          command -v jq >/dev/null 2>&1 && command -v convert >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 && command -v convert >/dev/null 2>&1 || sudo apt-get install -y jq imagemagick > /dev/null 2>&1 || true
+          command -v jq >/dev/null 2>&1 && command -v convert >/dev/null 2>&1 || sudo apt-get install -y jq imagemagick > /dev/null 2>&1 || true
 
           EF="${EXTRA_FEATURES_JSON:-{}}"
           MULTI_LINKS_JSON=$(echo "$EF" | jq -c '.multi_links // []' 2>/dev/null || echo '[]')
@@ -512,7 +512,7 @@ jobs:
           set -e
           SIGNING_CONFIG_JSON="$(jq -r '.inputs.signing_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
           SYNC_CONFIG_JSON="$(jq -r '.inputs.sync_config_json // ""' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
-          command -v jq >/dev/null 2>&1 || command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
+          command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq > /dev/null 2>&1 || true
           SC="${SIGNING_CONFIG_JSON:-}"
           if [ -z "$SC" ] || [ "$SC" = "{}" ]; then
             SC=$(printf '%s' "${SYNC_CONFIG_JSON:-{}}" | jq -c '.signing_config // {}' 2>/dev/null || echo '{}')
@@ -685,17 +685,7 @@ jobs:
               "$WEBHOOK_SECRET" || true
           else
             PAYLOAD_FILE="$(mktemp)"
-            python3 - "$BUILD_ID" "failed" "" "Build failed. Last lines: ${LOGS}" "$WEBHOOK_SECRET" <<'PY' > "$PAYLOAD_FILE"
-import json
-import sys
-raw_args = sys.argv[1:] + ["", "", "", "", ""]
-b_id, status, d_url, logs, secret = raw_args[:5]
-body = { "build_id": b_id, "status": status }
-if d_url: body["download_url"] = d_url
-if logs: body["logs"] = logs
-if secret: body["secret"] = secret
-json.dump(body, sys.stdout)
-PY
+            python3 -c 'import json,sys; a=sys.argv[1:]+["","","","",""]; b={"build_id":a[0],"status":a[1],"download_url":a[2],"logs":a[3],"secret":a[4]}; sys.stdout.write(json.dumps({k:v for k,v in b.items() if v}))' "$BUILD_ID" "failed" "" "Build failed. Last lines: ${LOGS}" "$WEBHOOK_SECRET" > "$PAYLOAD_FILE"
             curl -sS --retry 3 --retry-delay 2 --retry-all-errors --max-time 30 \
               -X POST "$CALLBACK_URL" \
               -H "Content-Type: application/json" \
