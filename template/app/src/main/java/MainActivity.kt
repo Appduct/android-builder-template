@@ -61,6 +61,7 @@ class MainActivity : AppCompatActivity() {
     // an OS fingerprint / face prompt. Never gates app startup.
     private val biometricEnabled: Boolean = %%BIOMETRIC_ENABLED%%
     private val keepAliveEnabled: Boolean = %%KEEP_ALIVE_ENABLED%%
+    private val batteryOptimizationEnabled: Boolean = %%BATTERY_OPTIMIZATION%%
     @Volatile private var activityInForeground = false
     @Volatile private var activityDestroyed = false
     @Volatile private var backgroundServiceActive = false
@@ -116,10 +117,10 @@ class MainActivity : AppCompatActivity() {
     private val urlCheckIntervalMs: Long = 5 * 60 * 1000L
     private val expiryTimestamp: Long = %%EXPIRY_TIMESTAMP%%L
     private var splashDismissed = false
-    // Splash must remain visible for at least 3 seconds on every launch for consistent
-    // branding, then dismiss as soon as the page paints (but never beyond the hard cap).
-    private val minSplashDurationMs: Long = 3000L
-    private val maxSplashDurationMs: Long = 3000L
+    // Splash must remain visible for at least 2 seconds on every launch for consistent
+    // branding, then dismiss as soon as the page paints (or up to 10s maximum cap).
+    private val minSplashDurationMs: Long = 2000L
+    private val maxSplashDurationMs: Long = 10000L
     private var splashShownAt: Long = 0L
     private var splashCapScheduled = false
     private var prewarmedConnection = false
@@ -166,6 +167,10 @@ class MainActivity : AppCompatActivity() {
     private var prewarmDone = false
     private var prewarmWebView: WebView? = null
     private var triedCacheFallback = false
+    private var loadRetryCount = 0
+    private val maxLoadRetries = 2
+    private var initialNetworkCallbackIgnored = false
+    private var mainFrameErrorOccurred = false
     // True once the WebView has painted real site content at least once (live or cached).
     // When true, a later network failure must NOT replace the visible page with an error
     // screen — we keep the cached content and only surface a toast.
@@ -318,14 +323,16 @@ class MainActivity : AppCompatActivity() {
         // Keep-Alive apps keep the website awake while minimized (see KeepAwakeWebView).
         if (keepAliveEnabled) {
             // Keep the layout's own WebView (swapping it at runtime left the app blank and
-            // pushed the site to the browser). Minimized JS stays alive via resumeTimers().
+            // pushed the site to the browser). The layout inflates KeepAwakeWebView, so the
+            // page stays "visible" to Chromium while minimized; timers stay resumed too.
+            (webView as? KeepAwakeWebView)?.keepAwakeWhileHidden = true
             try {
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O)
                     webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
             } catch (_: Throwable) {}
-            // Background alerts need notification permission on Android 13+; ask once the
-            // splash is gone so it doesn't collide with other launch permission prompts.
-            syncHandler.postDelayed({ if (!activityDestroyed) ensureNotificationPermission() }, 4500L)
+            // Many phones (Tecno, Infinix, Xiaomi, Samsung...) freeze or kill minimized apps
+            // under battery optimization even with a foreground service; ask once to lift it.
+            // Battery exemption is requested once, after the splash, by triggerStartupPermissionsSequence().
         }
         swipeRefresh = findViewById(R.id.swipeRefresh)
         progressBar = findViewById(R.id.progressBar)
@@ -352,6 +359,9 @@ class MainActivity : AppCompatActivity() {
             splashCapScheduled = false
             scheduleSplashCap()
             triedCacheFallback = false
+            loadRetryCount = 0
+            mainFrameErrorOccurred = false
+            try { webView.settings.cacheMode = WebSettings.LOAD_DEFAULT } catch (_: Exception) {}
             loadUrl()
         }
 
@@ -385,30 +395,26 @@ class MainActivity : AppCompatActivity() {
         splashView.visibility = View.VISIBLE
         splashShownAt = android.os.SystemClock.elapsedRealtime()
         scheduleSplashCap()
-        if (!landingEnabled) webView.visibility = View.INVISIBLE
-
+        // Do NOT set webView to INVISIBLE — Android WebView suppresses frame rendering
+        // and delays onPageCommitVisible when INVISIBLE. The elevated splashView covers it.
+        webView.visibility = View.VISIBLE
+        swipeRefresh.visibility = View.VISIBLE
 
         if (landingEnabled && setupLanding()) {
             // Landing shown — skip auto-loading the website URL. Tile clicks load it.
         } else {
             splashView.visibility = View.VISIBLE
-            webView.visibility = View.INVISIBLE
+            webView.visibility = View.VISIBLE
+            swipeRefresh.visibility = View.VISIBLE
 
-            if (isNetworkAvailable()) {
-                loadUrl()
-            } else if (offlineModeEnabled) {
-                // Serve the previously cached copy of the site.
+            if (offlineModeEnabled && !isNetworkAvailable()) {
+                // Offline mode enabled and device is offline: serve the previously cached copy.
                 webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
                 triedCacheFallback = true
-                loadUrl()
             } else {
-                // No network and Offline Mode off: still attempt the cached copy once so
-                // users see content instead of an error screen when a cache exists.
-                webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
-                triedCacheFallback = true
-                showOfflineToast()
-                loadUrl()
+                webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
             }
+            loadUrl()
         }
 
         // Always watch connectivity so the app recovers automatically (and retries the
@@ -616,29 +622,19 @@ class MainActivity : AppCompatActivity() {
                 val url = java.net.URL(target)
                 try { java.net.InetAddress.getAllByName(url.host) } catch (_: Exception) {}
                 val conn = url.openConnection() as java.net.HttpURLConnection
-                conn.requestMethod = "GET"
-                conn.connectTimeout = 4000
-                conn.readTimeout = 4000
+                conn.requestMethod = "HEAD"
+                conn.connectTimeout = 3000
+                conn.readTimeout = 3000
                 conn.instanceFollowRedirects = true
-                conn.setRequestProperty("Accept-Encoding", "gzip")
+                conn.setRequestProperty("User-Agent", "AppductPrewarm/1.0")
                 conn.setRequestProperty("X-Appduct-Prewarm", "1")
                 try {
-                    conn.inputStream.use { input ->
-                        val buf = ByteArray(8 * 1024)
-                        var total = 0
-                        // Read a small slice so the origin starts generating the document,
-                        // then bail — we do not need the full body.
-                        while (total < 32 * 1024) {
-                            val read = input.read(buf)
-                            if (read <= 0) break
-                            total += read
-                        }
-                    }
+                    conn.responseCode
                 } finally {
                     try { conn.disconnect() } catch (_: Exception) {}
                 }
             } catch (_: Throwable) {}
-        }.apply { isDaemon = true; priority = Thread.MAX_PRIORITY }.start()
+        }.apply { isDaemon = true; priority = Thread.NORM_PRIORITY }.start()
     }
 
 
@@ -655,7 +651,18 @@ class MainActivity : AppCompatActivity() {
             if (!splashDismissed) {
                 splashShownAt = 0L
                 if (!hasRenderedContent && !landingEnabled) {
-                    showError("Please check your internet connection and try again.")
+                    if (!isNetworkAvailable()) {
+                        showError("Please check your internet connection and try again.")
+                    } else {
+                        // Network is active; page load is simply taking longer or user was
+                        // interacting with a permission prompt. Dismiss splash and ensure webView is visible.
+                        if (errorView.visibility != View.VISIBLE) {
+                            hasRenderedContent = true
+                            webView.visibility = View.VISIBLE
+                            swipeRefresh.visibility = View.VISIBLE
+                        }
+                        dismissSplash()
+                    }
                 } else {
                     dismissSplash()
                 }
@@ -666,7 +673,7 @@ class MainActivity : AppCompatActivity() {
     private fun dismissSplash() {
         if (splashDismissed) return
         // Load-aware: dismiss as soon as the page paints, but keep a short minimum so the
-        // splash never flashes. The hard cap in scheduleSplashCap() bounds the wait at 3s.
+        // splash never flashes. The hard cap in scheduleSplashCap() bounds the wait at 10s.
         val shownFor = android.os.SystemClock.elapsedRealtime() - splashShownAt
         if (splashShownAt > 0L && shownFor < minSplashDurationMs) {
             Handler(Looper.getMainLooper()).postDelayed(
@@ -676,12 +683,24 @@ class MainActivity : AppCompatActivity() {
         }
 
         splashDismissed = true
-        if (hasRenderedContent) webView.visibility = View.VISIBLE
+        if (!landingEnabled && errorView.visibility != View.VISIBLE) {
+            webView.visibility = View.VISIBLE
+            swipeRefresh.visibility = View.VISIBLE
+        }
         val fadeOut = AlphaAnimation(1f, 0f)
         fadeOut.duration = 400
         fadeOut.fillAfter = true
         splashView.startAnimation(fadeOut)
-        Handler(Looper.getMainLooper()).postDelayed({ splashView.visibility = View.GONE }, 420)
+        Handler(Looper.getMainLooper()).postDelayed({
+            splashView.visibility = View.GONE
+            if (!landingEnabled && errorView.visibility != View.VISIBLE) {
+                webView.visibility = View.VISIBLE
+                swipeRefresh.visibility = View.VISIBLE
+            }
+            if (batteryOptimizationEnabled || keepAliveEnabled || pushEnabled) {
+                triggerStartupPermissionsSequence()
+            }
+        }, 420)
     }
 
     /**
@@ -795,6 +814,8 @@ class MainActivity : AppCompatActivity() {
             if (landingEnabled && landingContainer?.visibility == View.VISIBLE) {
                 // Native landing page is the current screen — leave it on top.
                 swipeRefresh.visibility = View.GONE
+            } else if (errorView.visibility == View.VISIBLE) {
+                swipeRefresh.visibility = View.GONE
             } else {
                 swipeRefresh.visibility = View.VISIBLE
                 if (splashDismissed) webView.visibility = View.VISIBLE
@@ -810,9 +831,10 @@ class MainActivity : AppCompatActivity() {
      */
     private fun ensureContentVisible() {
         if (fullscreenView != null) return
+        if (errorView.visibility == View.VISIBLE) return
         try {
             val stuckHolderAttached = fullscreenRoot?.parent != null
-            val contentHidden = swipeRefresh.visibility != View.VISIBLE &&
+            val contentHidden = (swipeRefresh.visibility != View.VISIBLE || (splashDismissed && webView.visibility != View.VISIBLE)) &&
                 !(landingEnabled && landingContainer?.visibility == View.VISIBLE)
             if (stuckHolderAttached || contentHidden || fullscreenContainer.visibility == View.VISIBLE) {
                 exitFullscreenAndRestoreContent()
@@ -837,14 +859,7 @@ class MainActivity : AppCompatActivity() {
             val cookieManager = CookieManager.getInstance()
             cookieManager.setAcceptCookie(true)
             cookieManager.setAcceptThirdPartyCookies(webView, true)
-            // Real-time compliance: clear only the HTTP cache (not cookies/storage) so logins persist.
-            // We do this ONCE per launch — after this, we trust the server's Cache-Control headers
-            // so background polling / status-check endpoints (which already send `no-store`) revalidate
-            // properly via ETag / If-Modified-Since. Forcing LOAD_NO_CACHE app-wide was breaking those
-            // conditional requests and causing sites like Carbby to silently drop upload-status updates.
-            // IMPORTANT: when Offline Mode is enabled we must NEVER wipe the cache at startup —
-            // doing so destroyed exactly the content offline access depends on.
-            if (!offlineMode) webView.clearCache(true)
+            // Trust standard HTTP cache headers and ETags across launches for fast startup.
 
             // Let the service worker function normally — many real-time SPAs route background
             // status polls, push handlers, and offline queues through their SW. Overriding the
@@ -1010,6 +1025,9 @@ class MainActivity : AppCompatActivity() {
             override fun onPageCommitVisible(view: WebView?, url: String?) {
                 super.onPageCommitVisible(view, url)
                 if (!url.isNullOrBlank() && url != "about:blank") {
+                    mainFrameErrorOccurred = false
+                    loadRetryCount = 0
+                    triedCacheFallback = false
                     hasRenderedContent = true
                     errorView.visibility = View.GONE
                     swipeRefresh.visibility = View.VISIBLE
@@ -1020,7 +1038,21 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             override fun onPageFinished(view: WebView?, url: String?) {
-
+                if (mainFrameErrorOccurred || errorView.visibility == View.VISIBLE) {
+                    progressBar.visibility = View.GONE
+                    swipeRefresh.isRefreshing = false
+                    return
+                }
+                if (!url.isNullOrBlank() && url != "about:blank") {
+                    loadRetryCount = 0
+                    triedCacheFallback = false
+                    hasRenderedContent = true
+                    if (!landingEnabled) {
+                        webView.visibility = View.VISIBLE
+                        swipeRefresh.visibility = View.VISIBLE
+                    }
+                    errorView.visibility = View.GONE
+                }
                 progressBar.visibility = View.GONE
                 swipeRefresh.isRefreshing = false
                 injectNativeShareShim(view)
@@ -1049,6 +1081,16 @@ class MainActivity : AppCompatActivity() {
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 if (request?.isForMainFrame == true) {
+                    val reqUrl = request.url?.toString() ?: ""
+                    if (reqUrl.startsWith("about:") || reqUrl.startsWith("data:") || reqUrl.startsWith("blob:")) return
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                        val code = error?.errorCode ?: 0
+                        val desc = error?.description?.toString() ?: ""
+                        if (code == WebViewClient.ERROR_UNKNOWN && (desc.contains("net::ERR_ABORTED") || desc.contains("cancelled"))) {
+                            return
+                        }
+                    }
+                    mainFrameErrorOccurred = true
                     handleMainFrameLoadError(view)
                 }
             }
@@ -1062,7 +1104,10 @@ class MainActivity : AppCompatActivity() {
                 // above handles main-frame errors on supported Android versions.
                 val activeUrl = view?.url
                 if (failingUrl.isNullOrBlank() ||
+                    failingUrl.startsWith("about:") || failingUrl.startsWith("data:") || failingUrl.startsWith("blob:") ||
                     (failingUrl != activeUrl && failingUrl != websiteUrl)) return
+                if (description?.contains("net::ERR_ABORTED") == true || description?.contains("cancelled") == true) return
+                mainFrameErrorOccurred = true
                 handleMainFrameLoadError(view)
             }
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -1246,98 +1291,105 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
-                if (fullscreenView != null || view == null) {
+                // Idempotency guard: some players call onShowCustomView twice. Per the
+                // WebChromeClient contract we must reject the second request, otherwise the
+                // first callback is orphaned and onHideCustomView never restores the page,
+                // leaving the app showing a blank/hidden screen.
+                if (fullscreenView != null) {
+                    try { callback?.onCustomViewHidden() } catch (_: Exception) {}
+                    return
+                }
+                if (view == null) {
                     try { callback?.onCustomViewHidden() } catch (_: Exception) {}
                     return
                 }
                 fullscreenView = view
                 fullscreenCallback = callback
-                preFullscreenOrientation = requestedOrientation
                 webView.visibility = View.GONE
+
                 swipeRefresh.visibility = View.GONE
                 bottomNav.visibility = View.GONE
+                // Save the current orientation lock so we can restore it when the user exits
+                // fullscreen. During fullscreen video/media playback we force landscape via
+                // SCREEN_ORIENTATION_SENSOR_LANDSCAPE — this rotates to landscape regardless of
+                // the user's system-level auto-rotate setting (which SENSOR would otherwise
+                // respect), and still allows flipping between the two landscape orientations
+                // based on how the device is held. Matches YouTube / native player UX.
+                preFullscreenOrientation = requestedOrientation
+                preFullscreenStatusBarColor = window.statusBarColor
+                preFullscreenNavigationBarColor = window.navigationBarColor
+                preFullscreenWindowBackground = window.decorView.background
 
-                // Prepare a black physical-window surface before rotating. Attaching to
-                // DecorView avoids the inset-aware AppCompat content root that can expose
-                // its white background as a frame on Android 15/16.
-                window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.BLACK))
-                androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
-                window.addFlags(
-                    android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN or
-                        android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                )
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-                    window.attributes = window.attributes.apply {
-                        layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                // TRUE edge-to-edge: attach the video view directly to the window's content
+                // root (NOT the ConstraintLayout, whose fitsSystemWindows padding/constraints
+                // would leave black borders around the video). Insets are consumed so the
+                // system never pads this container.
+                try {
+                    window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.BLACK))
+
+                    // Strip any inset padding the app root may already carry.
+                    (fullscreenContainer.parent as? View)?.apply {
+                        fitsSystemWindows = false
+                        setPadding(0, 0, 0, 0)
                     }
-                }
-                window.statusBarColor = android.graphics.Color.TRANSPARENT
-                window.navigationBarColor = android.graphics.Color.TRANSPARENT
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                    window.isStatusBarContrastEnforced = false
-                    window.isNavigationBarContrastEnforced = false
-                }
-                (view.parent as? android.view.ViewGroup)?.removeView(view)
-                view.setBackgroundColor(android.graphics.Color.BLACK)
-                view.setPadding(0, 0, 0, 0)
-                (window.decorView as android.view.ViewGroup).addView(
-                    view,
-                    android.widget.FrameLayout.LayoutParams(
-                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT
-                    ).also { it.gravity = android.view.Gravity.FILL }
-                )
-                view.bringToFront()
-                androidx.core.view.WindowInsetsControllerCompat(window, view).apply {
-                    isAppearanceLightStatusBars = false
-                    isAppearanceLightNavigationBars = false
-                    systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                    hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
-                }
-                @Suppress("DEPRECATION")
-                window.decorView.systemUiVisibility = (
-                    View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                        View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                )
-                view.post {
-                    if (fullscreenView != null) {
-                        androidx.core.view.WindowInsetsControllerCompat(window, view)
-                            .hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+
+                    // android.R.id.content is still an inset-aware AppCompat surface and can
+                    // expose its light window background as a white frame on Android 15/16.
+                    // DecorView is the only host that spans the complete physical window.
+                    val decorRoot = window.decorView as android.view.ViewGroup
+                    val holder = fullscreenRoot ?: FrameLayout(this@MainActivity).also { fr ->
+                        fr.setBackgroundColor(android.graphics.Color.BLACK)
+                        fr.fitsSystemWindows = false
+                        fr.elevation = Float.MAX_VALUE
+                        fr.isClickable = true
+                        fr.isFocusable = true
+                        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(fr) { v, _ ->
+                            v.setPadding(0, 0, 0, 0)
+                            androidx.core.view.WindowInsetsCompat.CONSUMED
+                        }
+                        fullscreenRoot = fr
                     }
+                    if (holder.parent == null) {
+                        decorRoot.addView(
+                            holder,
+                            FrameLayout.LayoutParams(
+                                FrameLayout.LayoutParams.MATCH_PARENT,
+                                FrameLayout.LayoutParams.MATCH_PARENT
+                            )
+                        )
+                    }
+                    holder.removeAllViews()
+                    (view.parent as? android.view.ViewGroup)?.removeView(view)
+                    view.setBackgroundColor(android.graphics.Color.BLACK)
+                    view.setPadding(0, 0, 0, 0)
+                    holder.addView(
+                        view,
+                        FrameLayout.LayoutParams(
+                            FrameLayout.LayoutParams.MATCH_PARENT,
+                            FrameLayout.LayoutParams.MATCH_PARENT
+                        ).also { it.gravity = android.view.Gravity.FILL }
+                    )
+                    holder.visibility = View.VISIBLE
+                    holder.bringToFront()
+                    holder.requestFocus()
+
+                    // Hide bars after the holder is attached, then repeat on the next frame;
+                    // orientation changes can otherwise restore a white navigation-bar scrim.
+                    applyFullscreenWindowMode()
+                    holder.post { if (fullscreenView != null) applyFullscreenWindowMode() }
+                } catch (_: Throwable) {
+                    // Fallback to the in-layout container if decor attachment fails.
+                    fullscreenContainer.addView(view)
+                    fullscreenContainer.visibility = View.VISIBLE
                 }
-                // Rotate only after the black edge-to-edge video surface is attached.
+
+                applyFullscreenWindowMode()
+                // Rotate only after the black edge-to-edge surface is attached. Rotating
+                // earlier exposes the theme window for a frame on slower devices/OEM skins.
                 requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             }
             override fun onHideCustomView() {
-                val activeView = fullscreenView
-                try { (activeView?.parent as? android.view.ViewGroup)?.removeView(activeView) } catch (_: Exception) {}
-                fullscreenContainer.removeAllViews()
-                fullscreenContainer.visibility = View.GONE
-                webView.visibility = View.VISIBLE
-                swipeRefresh.visibility = View.VISIBLE
-                if (%%BOTTOM_NAV%%) bottomNav.visibility = View.VISIBLE
-                val cb = fullscreenCallback
-                fullscreenView = null
-                fullscreenCallback = null
-                try { cb?.onCustomViewHidden() } catch (_: Exception) {}
-                requestedOrientation = preFullscreenOrientation
-                window.clearFlags(
-                    android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN or
-                        android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                )
-                androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, true)
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-                    window.attributes = window.attributes.apply {
-                        layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
-                    }
-                }
-                window.statusBarColor = android.graphics.Color.BLACK
-                window.navigationBarColor = android.graphics.Color.BLACK
-                androidx.core.view.WindowInsetsControllerCompat(window, window.decorView)
-                    .show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
-                @Suppress("DEPRECATION")
-                window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+                exitFullscreenAndRestoreContent()
             }
 
 
@@ -1948,19 +2000,8 @@ class MainActivity : AppCompatActivity() {
 
 
     private fun loadUrl() {
-        if (offlineModeEnabled) {
-            // Offline Mode must let responses be cached, so we do NOT send `no-store`
-            // request headers here (they prevented the WebView from ever storing the page)
-            // and we keep the URL stable so cache lookups hit when the device goes offline.
-            webView.loadUrl(websiteUrl)
-            return
-        }
-        val headers = hashMapOf(
-            "Cache-Control" to "no-cache, no-store, must-revalidate",
-            "Pragma" to "no-cache",
-            "Expires" to "0"
-        )
-        webView.loadUrl(websiteUrl, headers)
+        mainFrameErrorOccurred = false
+        webView.loadUrl(websiteUrl)
     }
 
     /** Keeps the WebView cache mode in sync with connectivity when Offline Mode is on. */
@@ -1986,8 +2027,22 @@ class MainActivity : AppCompatActivity() {
             cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: android.net.Network) {
                     Handler(Looper.getMainLooper()).post {
+                        if (!initialNetworkCallbackIgnored) {
+                            initialNetworkCallbackIgnored = true
+                            applyOfflineCacheMode()
+                            return@post
+                        }
                         triedCacheFallback = false
                         applyOfflineCacheMode()
+                        if (errorView.visibility == View.VISIBLE) {
+                            errorView.visibility = View.GONE
+                            webView.visibility = View.VISIBLE
+                            swipeRefresh.visibility = View.VISIBLE
+                            loadRetryCount = 0
+                            mainFrameErrorOccurred = false
+                            loadUrl()
+                            return@post
+                        }
                         try {
                             if (::webView.isInitialized && !isPickingFile && fullscreenView == null && !mediaCaptureActive) {
                                 val current = webView.url
@@ -2186,9 +2241,29 @@ class MainActivity : AppCompatActivity() {
             // Recover a service stopped by Android only while starting is permitted.
             %%KEEP_ALIVE_START%%
         }
-        // Self-heal: if a previous fullscreen video session left the WebView hidden or a
-        // stale fullscreen holder attached over the app, restore the content now.
-        if (::webView.isInitialized) ensureContentVisible()
+        // Self-heal: ensure WebView is visible and active when returning to the foreground
+        // (e.g. after system permission prompts or fullscreen video).
+        if (::webView.isInitialized) {
+            if (splashDismissed && !landingEnabled && errorView.visibility != View.VISIBLE) {
+                webView.visibility = View.VISIBLE
+                swipeRefresh.visibility = View.VISIBLE
+            }
+            ensureContentVisible()
+            val currentUrl = webView.url
+            if ((currentUrl.isNullOrBlank() || currentUrl == "about:blank") &&
+                isNetworkAvailable() &&
+                errorView.visibility != View.VISIBLE &&
+                !hasRenderedContent
+            ) {
+                loadUrl()
+            }
+        }
+        if (batteryPromptAwaitingResult) {
+            batteryPromptAwaitingResult = false
+            if ((batteryOptimizationEnabled || keepAliveEnabled) && !isBatteryUnrestricted()) {
+                syncHandler.postDelayed({ if (!activityDestroyed) showBatteryGuidanceDialog() }, 600L)
+            }
+        }
         // If we're returning from the system file/camera picker, do NOT reload the
         // page — that would discard the in-progress upload, the form state, and
         // bounce the user back to whatever route the SPA defaults to (often the
@@ -2269,15 +2344,133 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Throwable) { 0L }
     }
 
-    private fun ensureNotificationPermission() {
+    private var lastBatteryPromptAt: Long = 0L
+    private var startupPermissionsTriggered = false
+
+    private fun isBatteryUnrestricted(): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.M) return true
+        val pm = getSystemService(POWER_SERVICE) as? android.os.PowerManager ?: return true
+        return pm.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    @Volatile private var batteryPromptAwaitingResult = false
+    private var batteryGuidanceShowing = false
+    private val batteryPrefs by lazy { getSharedPreferences("appduct_battery", MODE_PRIVATE) }
+
+    /**
+     * Battery flow (single entry point, after the splash is gone):
+     * 1. First run: official OS dialog "Let app always run in the background?".
+     * 2. Still restricted afterwards (denied, or OEM layers like Tecno/Infinix/Xiaomi/Samsung that
+     *    ignore the standard exemption): an in-app explanation with an "Open Settings" button that
+     *    deep-links to the app's battery page, shown at most once every 3 days.
+     */
+    private fun requestBatteryExemptionDirectly(force: Boolean = false) {
+        if (!batteryOptimizationEnabled && !keepAliveEnabled) return
+        if (activityDestroyed || isFinishing) return
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.M) return
+        try {
+            if (isBatteryUnrestricted()) return
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (!force && lastBatteryPromptAt > 0L && (now - lastBatteryPromptAt < 120_000L)) return
+            lastBatteryPromptAt = now
+            if (!batteryPrefs.getBoolean("system_dialog_shown", false)) {
+                try {
+                    val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                        .setData(android.net.Uri.parse("package:$packageName"))
+                    if (intent.resolveActivity(packageManager) != null) {
+                        batteryPrefs.edit().putBoolean("system_dialog_shown", true).apply()
+                        batteryPromptAwaitingResult = true
+                        startActivity(intent)
+                        return
+                    }
+                } catch (_: Throwable) { batteryPromptAwaitingResult = false }
+            }
+            showBatteryGuidanceDialog()
+        } catch (_: Throwable) {}
+    }
+
+    private fun ensureBatteryExemption(force: Boolean = false) {
+        requestBatteryExemptionDirectly(force)
+    }
+
+    private fun oemBatteryTip(): String {
+        val m = (android.os.Build.MANUFACTURER ?: "").lowercase()
+        return when {
+            m.contains("tecno") || m.contains("infinix") || m.contains("itel") ->
+                "\n\nOn this phone also open Phone Master > Auto-start / Power saving and allow this app."
+            m.contains("xiaomi") || m.contains("redmi") || m.contains("poco") ->
+                "\n\nOn this phone also set Battery saver to \"No restrictions\" and turn on Autostart."
+            m.contains("samsung") ->
+                "\n\nOn this phone also remove the app from \"Sleeping apps\" in Battery settings."
+            m.contains("huawei") || m.contains("honor") ->
+                "\n\nOn this phone also set App launch to \"Manage manually\" and allow running in background."
+            m.contains("oppo") || m.contains("realme") || m.contains("oneplus") || m.contains("vivo") ->
+                "\n\nOn this phone also allow background activity and auto-launch for this app."
+            else -> ""
+        }
+    }
+
+    private fun showBatteryGuidanceDialog() {
+        if (activityDestroyed || isFinishing || batteryGuidanceShowing) return
+        if (isBatteryUnrestricted()) return
+        val last = batteryPrefs.getLong("guidance_shown_at", 0L)
+        val nowWall = System.currentTimeMillis()
+        if (last > 0L && nowWall - last < 3L * 24 * 60 * 60 * 1000) return
+        batteryPrefs.edit().putLong("guidance_shown_at", nowWall).apply()
+        batteryGuidanceShowing = true
+        try {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Keep the app running")
+                .setMessage("To receive updates while the app is minimized, set Battery to \"Unrestricted\" for this app." + oemBatteryTip())
+                .setPositiveButton("Open Settings") { _, _ -> openAppBatterySettings() }
+                .setNegativeButton("Not now", null)
+                .setOnDismissListener { batteryGuidanceShowing = false }
+                .show()
+        } catch (_: Throwable) { batteryGuidanceShowing = false }
+    }
+
+    private fun openAppBatterySettings() {
+        val uri = android.net.Uri.parse("package:$packageName")
+        val candidates = mutableListOf<Intent>()
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S)
+            candidates.add(Intent("android.settings.APP_BATTERY_SETTINGS").setData(uri))
+        candidates.add(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).setData(uri))
+        candidates.add(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        for (i in candidates) {
+            try {
+                if (i.resolveActivity(packageManager) != null) { startActivity(i); return }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    /**
+     * Chained permission flow:
+     * Asks for Notification permission first (Android 13+).
+     * Once answered, onRequestPermissionsResult immediately triggers the native battery optimization dialog.
+     * If notification permission is already granted or not needed, triggers battery optimization immediately.
+     */
+    private fun triggerStartupPermissionsSequence() {
+        if (activityDestroyed || startupPermissionsTriggered) return
+        startupPermissionsTriggered = true
+        val requestedNotif = if (pushEnabled || keepAliveEnabled) ensureNotificationPermission() else false
+        if (!requestedNotif) {
+            if ((batteryOptimizationEnabled || keepAliveEnabled) && !isBatteryUnrestricted()) {
+                requestBatteryExemptionDirectly(force = true)
+            }
+        }
+    }
+
+    private fun ensureNotificationPermission(): Boolean {
         try {
             if (android.os.Build.VERSION.SDK_INT >= 33 &&
                 checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
                     android.content.pm.PackageManager.PERMISSION_GRANTED
             ) {
                 requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 5150)
+                return true
             }
         } catch (_: Throwable) {}
+        return false
     }
 
     // ---- Runtime app URL ---------------------------------------------------------
@@ -2352,11 +2545,10 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {}
         try {
             if (::webView.isInitialized) {
-                // Old-origin cache/history is irrelevant now.
                 triedCacheFallback = false
+                mainFrameErrorOccurred = false
                 webView.stopLoading()
                 webView.clearHistory()
-                webView.clearCache(true)
                 errorView.visibility = View.GONE
                 webView.visibility = View.VISIBLE
                 loadUrl()
@@ -3032,35 +3224,6 @@ class MainActivity : AppCompatActivity() {
      * This shim tracks live capture in the page and reports it to the native layer, and
      * always stops tracks before the page unloads so the mic is free for the next page.
      */
-    /**
-     * Keep-Alive only: replace the layout's WebView with a KeepAwakeWebView so Chromium keeps
-     * the page "visible" while minimized. Without this the page is hidden on Home press, its
-     * timers are throttled, and Supabase realtime refuses to reconnect a dropped socket while
-     * hidden ("Not reconnecting as page is hidden!") — new bookings then stop arriving until
-     * the app is reopened. The renderer is also kept important so Android does not freeze it.
-     */
-    private fun installKeepAwakeWebView(original: WebView): WebView {
-        return try {
-            val parent = original.parent as? android.view.ViewGroup ?: return original
-            val index = parent.indexOfChild(original)
-            val replacement = KeepAwakeWebView(this).apply {
-                id = original.id
-                layoutParams = original.layoutParams
-                visibility = original.visibility
-                keepAwakeWhileHidden = true
-            }
-            parent.removeViewAt(index)
-            parent.addView(replacement, index)
-            try { original.destroy() } catch (_: Throwable) {}
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                try {
-                    replacement.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
-                } catch (_: Throwable) {}
-            }
-            replacement
-        } catch (_: Throwable) { original }
-    }
-
     /** Tells the page whether the app is minimized so alert sounds become native notifications. */
     private fun setPageMinimized(minimized: Boolean) {
         if (!keepAliveEnabled || !::webView.isInitialized) return
@@ -3342,11 +3505,27 @@ class MainActivity : AppCompatActivity() {
      * can never be painted, even briefly. Try one cache-only load, then show the native screen. */
     private fun handleMainFrameLoadError(view: WebView?) {
         val target = view ?: if (::webView.isInitialized) webView else return
+        if (hasRenderedContent) {
+            showOfflineToast()
+            return
+        }
+
+        if (loadRetryCount < maxLoadRetries) {
+            loadRetryCount++
+            Handler(Looper.getMainLooper()).postDelayed({
+                try {
+                    target.settings.cacheMode = WebSettings.LOAD_DEFAULT
+                    loadUrl()
+                } catch (_: Exception) {}
+            }, 1000L)
+            return
+        }
+
         target.visibility = View.GONE
         try { target.stopLoading() } catch (_: Exception) {}
         progressBar.visibility = View.GONE
         swipeRefresh.isRefreshing = false
-        if (!triedCacheFallback) {
+        if (offlineModeEnabled && !triedCacheFallback) {
             triedCacheFallback = true
             try {
                 target.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
@@ -3368,8 +3547,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showError(message: String) {
-        // Hide first: loading about:blank below is only cleanup and must never expose the
-        // failed navigation's built-in Chromium error page to the user.
+        // Keep webView hidden and show the native offline screen.
+        // Never load about:blank as it wipes the page and can flash/stagnate on subsequent visibility updates.
         webView.visibility = View.GONE
         swipeRefresh.visibility = View.GONE
         splashView.visibility = View.GONE
@@ -3378,7 +3557,6 @@ class MainActivity : AppCompatActivity() {
         progressBar.visibility = View.GONE
         try {
             webView.stopLoading()
-            webView.loadUrl("about:blank")
         } catch (_: Exception) {}
     }
     private fun showExpiredScreen() {
@@ -3452,6 +3630,19 @@ class MainActivity : AppCompatActivity() {
                     if (allGranted) req.grant(req.resources) else req.deny()
                 }
             } catch (_: Exception) { try { req?.deny() } catch (_: Exception) {} }
+        }
+        if (requestCode == 5150) {
+            if ((batteryOptimizationEnabled || keepAliveEnabled) && !isBatteryUnrestricted()) {
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (!activityDestroyed) requestBatteryExemptionDirectly(force = true)
+                }, 800L)
+            }
+        }
+        // Self-heal: permission dialog dismiss returns control; ensure content is visible
+        if (::webView.isInitialized && splashDismissed && !landingEnabled && errorView.visibility != View.VISIBLE) {
+            webView.visibility = View.VISIBLE
+            swipeRefresh.visibility = View.VISIBLE
+            ensureContentVisible()
         }
     }
 
@@ -3717,12 +3908,20 @@ class MainActivity : AppCompatActivity() {
 }
 
 /**
- * WebView used by Keep-Alive apps. When the activity is minimized Android reports the window
- * as hidden, which makes Chromium hide the page, throttle its timers and let realtime clients
- * give up reconnecting. While [keepAwakeWhileHidden] is set, hidden window visibility is
- * reported as visible so the wrapped site keeps receiving live updates in the background.
+ * The app's WebView, inflated straight from activity_main.xml (never swapped at runtime, so the
+ * WebViewClient and settings configured in onCreate always apply). For Keep-Alive apps
+ * [keepAwakeWhileHidden] is switched on: when the activity is minimized or the screen locks,
+ * Android hides the window/decor view, which makes Chromium mark the page hidden, throttle its
+ * timers (down to once a minute) and let realtime sockets miss heartbeats and drop. While the
+ * flag is set those system-driven hides are reported to Chromium as visible, so the wrapped
+ * site keeps its live connection running. Visibility changes made on the WebView itself
+ * (fullscreen video, offline screen) still pass through unchanged.
  */
-class KeepAwakeWebView(context: android.content.Context) : WebView(context) {
+class KeepAwakeWebView @JvmOverloads constructor(
+    context: android.content.Context,
+    attrs: android.util.AttributeSet? = null,
+    defStyleAttr: Int = android.R.attr.webViewStyle
+) : WebView(context, attrs, defStyleAttr) {
     @Volatile var keepAwakeWhileHidden: Boolean = false
 
     override fun onWindowVisibilityChanged(visibility: Int) {
@@ -3731,5 +3930,13 @@ class KeepAwakeWebView(context: android.content.Context) : WebView(context) {
             return
         }
         super.onWindowVisibilityChanged(visibility)
+    }
+
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        if (keepAwakeWhileHidden && changedView !== this && visibility != View.VISIBLE) {
+            super.onVisibilityChanged(changedView, View.VISIBLE)
+            return
+        }
+        super.onVisibilityChanged(changedView, visibility)
     }
 }
