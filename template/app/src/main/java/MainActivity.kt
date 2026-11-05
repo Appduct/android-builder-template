@@ -506,18 +506,131 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Throwable) {}
     }
 
+    // ---- Styled prompts ---------------------------------------------------------
+    // Branded bottom card used for every in-app permission / update prompt: app icon
+    // in a soft accent halo, clear headline, readable body, pill primary action.
+    private fun promptAccentColor(): Int {
+        val hc = "%%HEADER_COLOR%%"
+        return try {
+            if (hc.startsWith("#")) Color.parseColor(hc) else Color.parseColor("#2563EB")
+        } catch (_: Throwable) { Color.parseColor("#2563EB") }
+    }
+
+    private fun showStyledPrompt(
+        title: String,
+        message: String,
+        primary: String,
+        secondary: String?,
+        tip: String? = null,
+        onPrimary: () -> Unit,
+        onSecondary: () -> Unit = {},
+        onDismiss: () -> Unit = {}
+    ) {
+        if (isFinishing || activityDestroyed) { onDismiss(); return }
+        val d = resources.displayMetrics.density
+        fun dp(v: Int) = (v * d).toInt()
+        val night = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+        val accent = promptAccentColor()
+        val surface = if (night) Color.parseColor("#1C1F26") else Color.WHITE
+        val textMain = if (night) Color.parseColor("#F3F4F6") else Color.parseColor("#111827")
+        val textSub = if (night) Color.parseColor("#A1A7B3") else Color.parseColor("#5B6170")
+        val dialog = android.app.Dialog(this)
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        var acted = false
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = android.view.Gravity.CENTER_HORIZONTAL
+            setPadding(dp(24), dp(14), dp(24), dp(20))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(surface)
+                cornerRadii = floatArrayOf(dp(28).toFloat(), dp(28).toFloat(), dp(28).toFloat(), dp(28).toFloat(), 0f, 0f, 0f, 0f)
+            }
+        }
+        card.addView(View(this).apply {
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(textSub and 0x55FFFFFF); cornerRadius = dp(3).toFloat()
+            }
+        }, LinearLayout.LayoutParams(dp(40), dp(4)).apply { bottomMargin = dp(20) })
+
+        val halo = FrameLayout(this).apply {
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor((accent and 0x00FFFFFF) or 0x22000000)
+            }
+        }
+        val icon = android.widget.ImageView(this).apply {
+            try { setImageDrawable(packageManager.getApplicationIcon(packageName)) } catch (_: Throwable) {}
+            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+        }
+        halo.addView(icon, FrameLayout.LayoutParams(dp(52), dp(52), android.view.Gravity.CENTER))
+        card.addView(halo, LinearLayout.LayoutParams(dp(84), dp(84)).apply { bottomMargin = dp(18) })
+
+        card.addView(TextView(this).apply {
+            text = title; setTextColor(textMain); textSize = 21f
+            typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.BOLD)
+            gravity = android.view.Gravity.CENTER
+        }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        card.addView(TextView(this).apply {
+            text = message; setTextColor(textSub); textSize = 15f
+            setLineSpacing(dp(3).toFloat(), 1f); gravity = android.view.Gravity.CENTER
+        }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(if (tip.isNullOrBlank()) 24 else 14) })
+
+        if (!tip.isNullOrBlank()) {
+            card.addView(TextView(this).apply {
+                text = "💡  " + tip.trim(); setTextColor(textMain); textSize = 13.5f
+                setLineSpacing(dp(2).toFloat(), 1f)
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setColor((accent and 0x00FFFFFF) or 0x1A000000); cornerRadius = dp(14).toFloat()
+                }
+            }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(22) })
+        }
+
+        card.addView(TextView(this).apply {
+            text = primary; setTextColor(Color.WHITE); textSize = 16f
+            typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.BOLD)
+            gravity = android.view.Gravity.CENTER
+            isClickable = true; isFocusable = true
+            background = android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(0x33FFFFFF),
+                android.graphics.drawable.GradientDrawable().apply { setColor(accent); cornerRadius = dp(28).toFloat() },
+                null)
+            elevation = dp(2).toFloat()
+            setOnClickListener { acted = true; dialog.dismiss(); onPrimary() }
+        }, LinearLayout.LayoutParams(-1, dp(54)))
+
+        if (secondary != null) {
+            card.addView(TextView(this).apply {
+                text = secondary; setTextColor(textSub); textSize = 15f
+                gravity = android.view.Gravity.CENTER
+                isClickable = true; isFocusable = true
+                setOnClickListener { acted = true; dialog.dismiss(); onSecondary() }
+            }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(6) })
+        }
+
+        dialog.setContentView(card)
+        dialog.setCancelable(true)
+        dialog.setOnDismissListener { if (!acted) onSecondary(); onDismiss() }
+        dialog.window?.apply {
+            setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+            setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT)
+            setGravity(android.view.Gravity.BOTTOM)
+            setDimAmount(0.55f)
+            attributes = attributes.apply { windowAnimations = android.R.style.Animation_InputMethod }
+        }
+        try { dialog.show() } catch (_: Throwable) { onDismiss() }
+    }
+
     private fun showAppUpdateReadyPrompt() {
         try {
             val appName = try { applicationInfo.loadLabel(packageManager).toString() } catch (_: Throwable) { "App" }
-            androidx.appcompat.app.AlertDialog.Builder(this)
-                .setTitle("Update available")
-                .setMessage("A new version of $appName has been downloaded. Restart to apply the update.")
-                .setPositiveButton("Restart now") { _, _ ->
-                    try { appUpdateManager?.completeUpdate() } catch (_: Throwable) {}
-                }
-                .setNegativeButton("Later", null)
-                .setCancelable(true)
-                .show()
+            showStyledPrompt(
+                title = "Update ready",
+                message = "A fresh version of $appName is ready. Restart to enjoy the latest improvements.",
+                primary = "Restart now", secondary = "Later",
+                onPrimary = { try { appUpdateManager?.completeUpdate() } catch (_: Throwable) {} })
         } catch (_: Throwable) {}
     }
 
@@ -2397,15 +2510,15 @@ class MainActivity : AppCompatActivity() {
         val m = (android.os.Build.MANUFACTURER ?: "").lowercase()
         return when {
             m.contains("tecno") || m.contains("infinix") || m.contains("itel") ->
-                "\n\nOn this phone also open Phone Master > Auto-start / Power saving and allow this app."
+                "On this phone, also open Phone Master > Auto-start / Power saving and allow this app."
             m.contains("xiaomi") || m.contains("redmi") || m.contains("poco") ->
-                "\n\nOn this phone also set Battery saver to \"No restrictions\" and turn on Autostart."
+                "On this phone, also set Battery saver to \"No restrictions\" and turn on Autostart."
             m.contains("samsung") ->
-                "\n\nOn this phone also remove the app from \"Sleeping apps\" in Battery settings."
+                "On this phone, also remove the app from \"Sleeping apps\" in Battery settings."
             m.contains("huawei") || m.contains("honor") ->
-                "\n\nOn this phone also set App launch to \"Manage manually\" and allow running in background."
+                "On this phone, also set App launch to \"Manage manually\" and allow running in background."
             m.contains("oppo") || m.contains("realme") || m.contains("oneplus") || m.contains("vivo") ->
-                "\n\nOn this phone also allow background activity and auto-launch for this app."
+                "On this phone, also allow background activity and auto-launch for this app."
             else -> ""
         }
     }
@@ -2419,13 +2532,13 @@ class MainActivity : AppCompatActivity() {
         batteryPrefs.edit().putLong("guidance_shown_at", nowWall).apply()
         batteryGuidanceShowing = true
         try {
-            android.app.AlertDialog.Builder(this)
-                .setTitle("Keep the app running")
-                .setMessage("To receive updates while the app is minimized, set Battery to \"Unrestricted\" for this app." + oemBatteryTip())
-                .setPositiveButton("Open Settings") { _, _ -> openAppBatterySettings() }
-                .setNegativeButton("Not now", null)
-                .setOnDismissListener { batteryGuidanceShowing = false }
-                .show()
+            showStyledPrompt(
+                title = "Stay connected in the background",
+                message = "So you never miss an update while the app is minimized, set Battery to \"Unrestricted\".",
+                primary = "Open Settings", secondary = "Not now",
+                tip = oemBatteryTip().ifBlank { null },
+                onPrimary = { openAppBatterySettings() },
+                onDismiss = { batteryGuidanceShowing = false })
         } catch (_: Throwable) { batteryGuidanceShowing = false }
     }
 
@@ -2466,7 +2579,23 @@ class MainActivity : AppCompatActivity() {
                 checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
                     android.content.pm.PackageManager.PERMISSION_GRANTED
             ) {
-                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 5150)
+                val asked = getSharedPreferences("appduct_battery", MODE_PRIVATE)
+                if (asked.getBoolean("notif_preprompt_shown", false)) {
+                    requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 5150)
+                    return true
+                }
+                asked.edit().putBoolean("notif_preprompt_shown", true).apply()
+                showStyledPrompt(
+                    title = "Turn on notifications",
+                    message = "Get instant alerts for new bookings, messages and updates — even when the app is in the background.",
+                    primary = "Allow notifications", secondary = "Maybe later",
+                    onPrimary = {
+                        try { requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 5150) } catch (_: Throwable) {}
+                    },
+                    onSecondary = {
+                        if ((batteryOptimizationEnabled || keepAliveEnabled) && !isBatteryUnrestricted())
+                            requestBatteryExemptionDirectly(force = true)
+                    })
                 return true
             }
         } catch (_: Throwable) {}
@@ -2646,15 +2775,11 @@ class MainActivity : AppCompatActivity() {
         try {
             if (isFinishing || isDestroyed) return
             prefs.edit().putBoolean(promptedKey, true).apply()
-            androidx.appcompat.app.AlertDialog.Builder(this)
-                .setTitle("Update available")
-                .setMessage(text)
-                .setPositiveButton("Update") { _, _ ->
-                    try { startActivity(storeIntentForUpdate(storeUrl)) } catch (_: Throwable) {}
-                }
-                .setNegativeButton("Later", null)
-                .setCancelable(true)
-                .show()
+            showStyledPrompt(
+                title = "New version available",
+                message = text,
+                primary = "Update", secondary = "Later",
+                onPrimary = { try { startActivity(storeIntentForUpdate(storeUrl)) } catch (_: Throwable) {} })
         } catch (_: Throwable) {}
     }
 
