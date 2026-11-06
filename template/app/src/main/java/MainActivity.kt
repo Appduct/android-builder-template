@@ -3630,8 +3630,25 @@ class MainActivity : AppCompatActivity() {
      * can never be painted, even briefly. Try one cache-only load, then show the native screen. */
     private fun handleMainFrameLoadError(view: WebView?) {
         val target = view ?: if (::webView.isInitialized) webView else return
+        // Hide first on EVERY main-frame failure (DNS drops such as ERR_NAME_NOT_RESOLVED
+        // included) so Chromium's "Webpage not available" document is never painted.
+        // onPageCommitVisible makes the WebView visible again once real content commits.
+        target.visibility = View.GONE
+        try { target.stopLoading() } catch (_: Exception) {}
         if (hasRenderedContent) {
             showOfflineToast()
+            try {
+                if (target.canGoBack()) {
+                    target.settings.cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
+                    target.goBack()
+                } else {
+                    target.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                    loadUrl()
+                }
+            } catch (_: Exception) {}
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (::webView.isInitialized && webView.visibility != View.VISIBLE) handleUnreachable()
+            }, 2500L)
             return
         }
 
