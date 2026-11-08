@@ -42,7 +42,10 @@
     <uses-feature android:name="android.hardware.wifi" android:required="false" />
     <uses-feature android:name="android.hardware.fingerprint" android:required="false" />
     <uses-feature android:name="android.hardware.faketouch" android:required="false" />
+    <!-- Android TV: declaring leanback as optional makes the app installable and
+         launchable on TV while still shipping to phones/tablets. -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
+
 
     <queries>
         <package android:name="com.whatsapp" />
@@ -86,6 +89,7 @@
 
     <application
         android:allowBackup="true"
+        android:hardwareAccelerated="true"
         android:icon="@mipmap/ic_launcher"
         android:label="%%APP_NAME%%"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -104,6 +108,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:hardwareAccelerated="true"
             android:screenOrientation="%%SCREEN_ORIENTATION%%"
             android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|keyboardHidden|layoutDirection|locale"
@@ -111,6 +116,7 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+                <!-- Makes the app appear on the Android TV / Google TV home row. -->
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
