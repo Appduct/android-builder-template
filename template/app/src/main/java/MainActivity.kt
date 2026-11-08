@@ -171,6 +171,9 @@ class MainActivity : AppCompatActivity() {
     private val maxLoadRetries = 2
     private var initialNetworkCallbackIgnored = false
     private var mainFrameErrorOccurred = false
+    private var navigationSequence = 0L
+    private var failedPageUrl: String? = null
+    private var recoveringFailedPage = false
     // True once the WebView has painted real site content at least once (live or cached).
     // When true, a later network failure must NOT replace the visible page with an error
     // screen — we keep the cached content and only surface a toast.
@@ -770,7 +773,6 @@ class MainActivity : AppCompatActivity() {
                         // Network is active; page load is simply taking longer or user was
                         // interacting with a permission prompt. Dismiss splash and ensure webView is visible.
                         if (errorView.visibility != View.VISIBLE) {
-                            hasRenderedContent = true
                             webView.visibility = View.VISIBLE
                             swipeRefresh.visibility = View.VISIBLE
                         }
@@ -1115,6 +1117,7 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                navigationSequence++
                 // Only non-web schemes are re-routed here; http(s) routing happens in
                 // shouldOverrideUrlLoading. Never blank the app's own website.
                 if (!url.isNullOrBlank() && !url.startsWith("http", ignoreCase = true) &&
@@ -1138,6 +1141,9 @@ class MainActivity : AppCompatActivity() {
             override fun onPageCommitVisible(view: WebView?, url: String?) {
                 super.onPageCommitVisible(view, url)
                 if (!url.isNullOrBlank() && url != "about:blank") {
+                    if (mainFrameErrorOccurred) return
+                    recoveringFailedPage = false
+                    failedPageUrl = null
                     mainFrameErrorOccurred = false
                     loadRetryCount = 0
                     triedCacheFallback = false
@@ -1157,6 +1163,8 @@ class MainActivity : AppCompatActivity() {
                     return
                 }
                 if (!url.isNullOrBlank() && url != "about:blank") {
+                    recoveringFailedPage = false
+                    failedPageUrl = null
                     loadRetryCount = 0
                     triedCacheFallback = false
                     hasRenderedContent = true
@@ -1204,6 +1212,7 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                     mainFrameErrorOccurred = true
+                    failedPageUrl = reqUrl
                     handleMainFrameLoadError(view)
                 }
             }
@@ -1212,6 +1221,9 @@ class MainActivity : AppCompatActivity() {
             override fun onReceivedError(
                 view: WebView?, errorCode: Int, description: String?, failingUrl: String?
             ) {
+                // API 23+ already delivers the main-frame callback above. Processing both
+                // consumes retries twice and can turn one DNS hiccup into an offline loop.
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) return
                 // This deprecated callback also fires for failed images and scripts. Only
                 // handle it when it identifies the active top-level page; the modern callback
                 // above handles main-frame errors on supported Android versions.
@@ -1221,6 +1233,7 @@ class MainActivity : AppCompatActivity() {
                     (failingUrl != activeUrl && failingUrl != websiteUrl)) return
                 if (description?.contains("net::ERR_ABORTED") == true || description?.contains("cancelled") == true) return
                 mainFrameErrorOccurred = true
+                failedPageUrl = failingUrl
                 handleMainFrameLoadError(view)
             }
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -2140,28 +2153,32 @@ class MainActivity : AppCompatActivity() {
             cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: android.net.Network) {
                     Handler(Looper.getMainLooper()).post {
+                        if (activityDestroyed) return@post
                         if (!initialNetworkCallbackIgnored) {
                             initialNetworkCallbackIgnored = true
                             applyOfflineCacheMode()
+                            recoverFailedPageIfNeeded()
                             return@post
                         }
-                        triedCacheFallback = false
                         applyOfflineCacheMode()
-                        if (errorView.visibility == View.VISIBLE) {
-                            errorView.visibility = View.GONE
-                            webView.visibility = View.VISIBLE
-                            swipeRefresh.visibility = View.VISIBLE
-                            loadRetryCount = 0
-                            mainFrameErrorOccurred = false
-                            loadUrl()
-                            return@post
-                        }
+                        recoverFailedPageIfNeeded()
                         try {
-                            if (::webView.isInitialized && !isPickingFile && fullscreenView == null && !mediaCaptureActive) {
-                                val current = webView.url
-                                if (current.isNullOrBlank() || current == "about:blank") loadUrl() else webView.reload()
+                            if (::webView.isInitialized && errorView.visibility != View.VISIBLE &&
+                                !isPickingFile && fullscreenView == null && !mediaCaptureActive) {
+                                nudgePageToReconnectAndRefetch()
                             }
                         } catch (_: Exception) {}
+                    }
+                }
+
+                override fun onCapabilitiesChanged(network: android.net.Network, caps: NetworkCapabilities) {
+                    if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                        Handler(Looper.getMainLooper()).post {
+                            if (!activityDestroyed) {
+                                applyOfflineCacheMode()
+                                recoverFailedPageIfNeeded()
+                            }
+                        }
                     }
                 }
 
@@ -2170,6 +2187,22 @@ class MainActivity : AppCompatActivity() {
                 }
             })
         } catch (_: Exception) {}
+    }
+
+    private fun recoverFailedPageIfNeeded() {
+        if (activityDestroyed || !::webView.isInitialized || recoveringFailedPage ||
+            errorView.visibility != View.VISIBLE || !isNetworkAvailable() ||
+            isPickingFile || mediaCaptureActive) return
+        loadRetryCount = 0
+        triedCacheFallback = false
+        recoveringFailedPage = true
+        mainFrameErrorOccurred = false
+        webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
+        // Keep the native overlay in place until the new page actually commits.
+        // A GONE WebView cannot paint, which can prevent onPageCommitVisible recovery.
+        swipeRefresh.visibility = View.VISIBLE
+        webView.visibility = View.VISIBLE
+        webView.loadUrl(failedPageUrl ?: websiteUrl)
     }
 
     private fun loadFreshWebsite() {
@@ -3626,56 +3659,44 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {}
     }
 
-    /** Hide the WebView before fallback navigation so Chromium's URL-bearing error document
-     * can never be painted, even briefly. Try one cache-only load, then show the native screen. */
+    /** Cover Chromium's URL-bearing error document, then run bounded live/cache recovery. */
     private fun handleMainFrameLoadError(view: WebView?) {
         val target = view ?: if (::webView.isInitialized) webView else return
-        // Hide first on EVERY main-frame failure (DNS drops such as ERR_NAME_NOT_RESOLVED
-        // included) so Chromium's "Webpage not available" document is never painted.
-        // onPageCommitVisible makes the WebView visible again once real content commits.
+        val sequence = navigationSequence
+        val retryUrl = failedPageUrl ?: websiteUrl
         target.visibility = View.GONE
         try { target.stopLoading() } catch (_: Exception) {}
-        if (hasRenderedContent) {
-            showOfflineToast()
-            try {
-                if (target.canGoBack()) {
-                    target.settings.cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
-                    target.goBack()
-                } else {
-                    target.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
-                    loadUrl()
-                }
-            } catch (_: Exception) {}
-            Handler(Looper.getMainLooper()).postDelayed({
-                if (::webView.isInitialized && webView.visibility != View.VISIBLE) handleUnreachable()
-            }, 2500L)
-            return
-        }
+        // A site/DNS/TLS failure is not proof that the phone has no internet.
+        handleUnreachable()
+        // Render behind the native overlay so successful commits still arrive.
+        swipeRefresh.visibility = View.VISIBLE
+        target.visibility = View.VISIBLE
 
-        if (loadRetryCount < maxLoadRetries) {
+        if (!triedCacheFallback && loadRetryCount < maxLoadRetries && isNetworkAvailable()) {
             loadRetryCount++
+            recoveringFailedPage = true
             Handler(Looper.getMainLooper()).postDelayed({
+                if (activityDestroyed || navigationSequence != sequence || !mainFrameErrorOccurred) return@postDelayed
                 try {
                     target.settings.cacheMode = WebSettings.LOAD_DEFAULT
-                    loadUrl()
-                } catch (_: Exception) {}
-            }, 1000L)
+                    mainFrameErrorOccurred = false
+                    target.loadUrl(retryUrl)
+                } catch (_: Exception) { recoveringFailedPage = false }
+            }, 1000L * loadRetryCount)
             return
         }
 
-        target.visibility = View.GONE
-        try { target.stopLoading() } catch (_: Exception) {}
-        progressBar.visibility = View.GONE
-        swipeRefresh.isRefreshing = false
         if (offlineModeEnabled && !triedCacheFallback) {
+            // Set BEFORE navigating: a failed cache read must not recurse forever.
             triedCacheFallback = true
+            recoveringFailedPage = true
             try {
                 target.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
-                target.reload()
-            } catch (_: Exception) {}
-            showOfflineToast()
+                mainFrameErrorOccurred = false
+                target.loadUrl(retryUrl)
+            } catch (_: Exception) { recoveringFailedPage = false }
         } else {
-            handleUnreachable()
+            recoveringFailedPage = false
         }
     }
 
@@ -3684,8 +3705,12 @@ class MainActivity : AppCompatActivity() {
      * replace it with the native offline screen; never leave Chromium's error document visible.
      */
     private fun handleUnreachable() {
-        showOfflineToast()
-        showError("Please check your internet connection and try again.")
+        if (isNetworkAvailable()) {
+            showError("Unable to load this page right now. Please try again.")
+        } else {
+            showOfflineToast()
+            showError("Please check your internet connection and try again.")
+        }
     }
 
     private fun showError(message: String) {
