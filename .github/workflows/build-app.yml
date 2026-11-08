@@ -340,6 +340,18 @@ jobs:
             echo "✅ $name = $value"
           }
 
+          check_optional_unit() {
+            local name="$1" value="$2"
+            if [ -z "$value" ] || [ "$value" = "none" ] || [ "$value" = "null" ]; then
+              echo "ℹ️ $name not configured; skipping this ad format"
+              return
+            fi
+            check_id "$name" "$value" "$UNIT_RE"
+            if [ -n "$MAIN_ACT" ] && [ -f "$MAIN_ACT" ]; then
+              grep -Fq -- "$value" "$MAIN_ACT" || { echo "❌ MainActivity missing $name"; FAIL=1; }
+            fi
+          }
+
           ADMOB_APP_ID_INPUT="${{ inputs.admob_app_id }}"
           ADMOB_BANNER_ID_INPUT="${{ inputs.admob_banner_id }}"
           ADMOB_INTERSTITIAL_ID_INPUT="${{ inputs.admob_interstitial_id }}"
@@ -347,8 +359,8 @@ jobs:
           UNIT_RE='^ca-app-pub-[0-9]+/[0-9]+$'
 
           check_id "App ID"           "$ADMOB_APP_ID_INPUT"          "$APPID_RE"
-          check_id "Banner Unit ID"   "$ADMOB_BANNER_ID_INPUT"       "$UNIT_RE"
-          check_id "Interstitial Unit ID" "$ADMOB_INTERSTITIAL_ID_INPUT" "$UNIT_RE"
+          check_optional_unit "Banner Unit ID" "$ADMOB_BANNER_ID_INPUT"
+          check_optional_unit "Interstitial Unit ID" "$ADMOB_INTERSTITIAL_ID_INPUT"
 
           # Residual placeholder scan
           if grep -RInE '%%ADMOB_[A-Z_]+%%' build-output/app/src/main 2>/dev/null; then
@@ -369,19 +381,21 @@ jobs:
             echo "❌ MainActivity.kt not found"; FAIL=1
           else
             grep -q "MobileAds.initialize" "$MAIN_ACT" || { echo "❌ MainActivity missing MobileAds.initialize"; FAIL=1; }
-            grep -q "$ADMOB_BANNER_ID_INPUT" "$MAIN_ACT" || { echo "❌ MainActivity missing real Banner ID"; FAIL=1; }
-            grep -q "$ADMOB_INTERSTITIAL_ID_INPUT" "$MAIN_ACT" || { echo "❌ MainActivity missing real Interstitial ID"; FAIL=1; }
           fi
 
-          if [ "${{ inputs.admob_app_open_enabled }}" = "true" ]; then
-            AO_ID=$(echo '${{ inputs.extra_features_json }}' | jq -r '.admob_app_open_id // empty')
+          EF=$(jq -r '.inputs.extra_features_json // "{}"' "$GITHUB_EVENT_PATH")
+          if [ "$(printf '%s' "$EF" | jq -r '.admob_app_open_enabled // false')" = "true" ]; then
+            AO_ID=$(printf '%s' "$EF" | jq -r '.admob_app_open_id // empty')
             check_id "App Open Unit ID" "$AO_ID" "$UNIT_RE"
-            grep -q "$AO_ID" "$MAIN_ACT" || { echo "❌ MainActivity missing App Open ID"; FAIL=1; }
+            if [ -n "$MAIN_ACT" ] && [ -f "$MAIN_ACT" ]; then
+              grep -Fq -- "$AO_ID" "$MAIN_ACT" || { echo "❌ MainActivity missing App Open ID"; FAIL=1; }
+            fi
           fi
 
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "💥 AdMob verification FAILED — aborting build so ads are guaranteed to work in next APK."
+            echo "AdMob verification failed: check the App ID and configured ad unit IDs; unconfigured optional formats are allowed." > /tmp/admob_verify_error.log
             exit 1
           fi
           echo "🎉 All AdMob IDs successfully injected."
@@ -669,6 +683,8 @@ jobs:
           LOGS=""
           if [ -f build-output/build.log ]; then
             LOGS="$(tail -50 build-output/build.log 2>/dev/null || true)"
+          elif [ -f /tmp/admob_verify_error.log ]; then
+            LOGS="$(cat /tmp/admob_verify_error.log)"
           elif [ -f /tmp/icon_convert_error.log ]; then
             LOGS="$(cat /tmp/icon_convert_error.log 2>/dev/null || true)"
           fi
