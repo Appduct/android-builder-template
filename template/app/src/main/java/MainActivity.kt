@@ -984,7 +984,11 @@ class MainActivity : AppCompatActivity() {
             // flow. We keep SW cache at LOAD_DEFAULT so the SW's own Cache API works as designed.
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
                 try {
-                    ServiceWorkerController.getInstance().serviceWorkerWebSettings.cacheMode = WebSettings.LOAD_DEFAULT
+                    ServiceWorkerController.getInstance().serviceWorkerWebSettings.apply {
+                        cacheMode = WebSettings.LOAD_DEFAULT
+                        blockNetworkLoads = false
+                        allowContentAccess = true
+                    }
                 } catch (_: Exception) {}
             }
         } catch (_: Exception) {}
@@ -994,6 +998,15 @@ class MainActivity : AppCompatActivity() {
             domStorageEnabled = true
             databaseEnabled = true
             allowFileAccess = true
+            allowContentAccess = true
+            blockNetworkLoads = false
+            // Never relax file-origin security to enable HTTPS embeds. DOM storage and
+            // third-party cookies above apply to frames too; CORS, SameSite and iframe
+            // Permissions-Policy must still be configured by the embedding website.
+            @Suppress("DEPRECATION")
+            setAllowFileAccessFromFileURLs(false)
+            @Suppress("DEPRECATION")
+            setAllowUniversalAccessFromFileURLs(false)
             // Offline Mode: stay browser-equivalent while online (so the HTTP cache fills with
             // fresh, revalidated content) and fall back to cache-only when the network is gone.
             // Always start network-first: cold-launch connectivity checks can falsely report offline,
@@ -2995,6 +3008,11 @@ class MainActivity : AppCompatActivity() {
             prewarmWebView = WebView(this).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
+                settings.databaseEnabled = true
+                settings.allowContentAccess = true
+                settings.blockNetworkLoads = false
+                // Cookie acceptance is per WebView, not inherited from the visible one.
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                 settings.cacheMode = WebSettings.LOAD_DEFAULT
                 settings.userAgentString = webView.settings.userAgentString
                 settings.mediaPlaybackRequiresUserGesture = true
