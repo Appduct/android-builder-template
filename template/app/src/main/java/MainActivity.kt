@@ -411,8 +411,9 @@ class MainActivity : AppCompatActivity() {
             swipeRefresh.visibility = View.VISIBLE
 
             if (offlineModeEnabled && !isNetworkAvailable()) {
-                // Offline mode enabled and device is offline: serve the previously cached copy.
-                webView.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                // Offline mode enabled and device looks offline: prefer cache, but still allow
+                // network so a false-offline reading at cold launch never blocks media/streams.
+                webView.settings.cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
                 triedCacheFallback = true
             } else {
                 webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
@@ -995,7 +996,9 @@ class MainActivity : AppCompatActivity() {
             allowFileAccess = true
             // Offline Mode: stay browser-equivalent while online (so the HTTP cache fills with
             // fresh, revalidated content) and fall back to cache-only when the network is gone.
-            cacheMode = if (offlineMode && !isNetworkAvailable()) WebSettings.LOAD_CACHE_ONLY else WebSettings.LOAD_DEFAULT
+            // Always start network-first: cold-launch connectivity checks can falsely report offline,
+            // and cache-only mode starves live streams/APIs (ERR_CACHE_MISS -> "stream offline").
+            cacheMode = WebSettings.LOAD_DEFAULT
 
             setSupportZoom(true)
             builtInZoomControls = true
@@ -1003,7 +1006,7 @@ class MainActivity : AppCompatActivity() {
             loadWithOverviewMode = true
             useWideViewPort = true
             mediaPlaybackRequiresUserGesture = false
-            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             // Support target=_blank / window.open so we can route share-link popups to the OS
             setSupportMultipleWindows(true)
             javaScriptCanOpenWindowsAutomatically = true
@@ -2138,7 +2141,7 @@ class MainActivity : AppCompatActivity() {
         if (!::webView.isInitialized) return
         try {
             webView.settings.cacheMode = if (offlineModeEnabled && !isNetworkAvailable()) {
-                WebSettings.LOAD_CACHE_ONLY
+                WebSettings.LOAD_CACHE_ELSE_NETWORK
             } else {
                 WebSettings.LOAD_DEFAULT
             }
@@ -3694,7 +3697,7 @@ class MainActivity : AppCompatActivity() {
             triedCacheFallback = true
             recoveringFailedPage = true
             try {
-                target.settings.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                target.settings.cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
                 mainFrameErrorOccurred = false
                 target.loadUrl(retryUrl)
             } catch (_: Exception) { recoveringFailedPage = false }
