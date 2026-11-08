@@ -1148,6 +1148,8 @@ class MainActivity : AppCompatActivity() {
                     loadRetryCount = 0
                     triedCacheFallback = false
                     hasRenderedContent = true
+                    // A successful cached fallback must not pin later requests to cache-only.
+                    applyOfflineCacheMode()
                     errorView.visibility = View.GONE
                     swipeRefresh.visibility = View.VISIBLE
                     webView.visibility = View.VISIBLE
@@ -1168,6 +1170,7 @@ class MainActivity : AppCompatActivity() {
                     loadRetryCount = 0
                     triedCacheFallback = false
                     hasRenderedContent = true
+                    applyOfflineCacheMode()
                     if (!landingEnabled) {
                         webView.visibility = View.VISIBLE
                         swipeRefresh.visibility = View.VISIBLE
