@@ -383,9 +383,9 @@ jobs:
             grep -q "MobileAds.initialize" "$MAIN_ACT" || { echo "❌ MainActivity missing MobileAds.initialize"; FAIL=1; }
           fi
 
-          EF=$(jq -r '.inputs.extra_features_json // "{}"' "$GITHUB_EVENT_PATH")
-          if [ "$(printf '%s' "$EF" | jq -r '.admob_app_open_enabled // false')" = "true" ]; then
-            AO_ID=$(printf '%s' "$EF" | jq -r '.admob_app_open_id // empty')
+          AO_ENABLED=$(python3 -c "import json, os; p=os.environ.get('GITHUB_EVENT_PATH',''); d=json.load(open(p)) if p and os.path.exists(p) else {}; ef=json.loads(d.get('inputs',{}).get('extra_features_json') or '{}'); print('true' if ef.get('admob_app_open_enabled') in [True, 'true'] else 'false')")
+          if [ "$AO_ENABLED" = "true" ]; then
+            AO_ID=$(python3 -c "import json, os; p=os.environ.get('GITHUB_EVENT_PATH',''); d=json.load(open(p)) if p and os.path.exists(p) else {}; ef=json.loads(d.get('inputs',{}).get('extra_features_json') or '{}'); print(ef.get('admob_app_open_id') or '')")
             check_id "App Open Unit ID" "$AO_ID" "$UNIT_RE"
             if [ -n "$MAIN_ACT" ] && [ -f "$MAIN_ACT" ]; then
               grep -Fq -- "$AO_ID" "$MAIN_ACT" || { echo "❌ MainActivity missing App Open ID"; FAIL=1; }
