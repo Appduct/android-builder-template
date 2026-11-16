@@ -9,6 +9,7 @@ import android.graphics.Color
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.net.http.SslError
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -340,6 +341,16 @@ class MainActivity : AppCompatActivity() {
         swipeRefresh = findViewById(R.id.swipeRefresh)
         progressBar = findViewById(R.id.progressBar)
         errorView = findViewById(R.id.errorView)
+        try {
+            val typedValue = android.util.TypedValue()
+            if (theme.resolveAttribute(android.R.attr.colorBackground, typedValue, true)) {
+                errorView.setBackgroundColor(typedValue.data)
+            } else {
+                errorView.setBackgroundColor(Color.WHITE)
+            }
+        } catch (_: Throwable) {
+            errorView.setBackgroundColor(Color.WHITE)
+        }
         errorText = findViewById(R.id.errorText)
         splashView = findViewById(R.id.splashView)
         fullscreenContainer = findViewById(R.id.fullscreenContainer)
@@ -1123,7 +1134,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 try {
                     android.widget.Toast.makeText(
-                        this, "Download failed: ${e.message ?: e.javaClass.simpleName}",
+                        this, "Download could not be completed. Please try again.",
                         android.widget.Toast.LENGTH_LONG
                     ).show()
                 } catch (_: Exception) {}
@@ -1230,6 +1241,7 @@ class MainActivity : AppCompatActivity() {
                             return
                         }
                     }
+                    try { view?.stopLoading() } catch (_: Exception) {}
                     mainFrameErrorOccurred = true
                     failedPageUrl = reqUrl
                     handleMainFrameLoadError(view)
@@ -1251,9 +1263,32 @@ class MainActivity : AppCompatActivity() {
                     failingUrl.startsWith("about:") || failingUrl.startsWith("data:") || failingUrl.startsWith("blob:") ||
                     (failingUrl != activeUrl && failingUrl != websiteUrl)) return
                 if (description?.contains("net::ERR_ABORTED") == true || description?.contains("cancelled") == true) return
+                try { view?.stopLoading() } catch (_: Exception) {}
                 mainFrameErrorOccurred = true
                 failedPageUrl = failingUrl
                 handleMainFrameLoadError(view)
+            }
+
+            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                try { handler?.cancel() } catch (_: Exception) {}
+                try { view?.stopLoading() } catch (_: Exception) {}
+                mainFrameErrorOccurred = true
+                failedPageUrl = error?.url ?: view?.url ?: websiteUrl
+                handleMainFrameLoadError(view)
+            }
+
+            override fun onReceivedHttpError(
+                view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?
+            ) {
+                if (request?.isForMainFrame == true) {
+                    val code = errorResponse?.statusCode ?: 0
+                    if (code >= 500) {
+                        try { view?.stopLoading() } catch (_: Exception) {}
+                        mainFrameErrorOccurred = true
+                        failedPageUrl = request.url?.toString() ?: websiteUrl
+                        handleMainFrameLoadError(view)
+                    }
+                }
             }
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: return false
@@ -1560,6 +1595,98 @@ class MainActivity : AppCompatActivity() {
             ): Boolean {
                 result?.confirm()
                 return true
+            }
+
+            override fun onJsAlert(
+                view: WebView?, url: String?, message: String?, result: JsResult?
+            ): Boolean {
+                if (isFinishing || isDestroyed) {
+                    result?.cancel()
+                    return true
+                }
+                try {
+                    val appName = try { applicationInfo.loadLabel(packageManager).toString() } catch (_: Throwable) { "Alert" }
+                    androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle(appName)
+                        .setMessage(message ?: "")
+                        .setPositiveButton(android.R.string.ok) { dialog, _ ->
+                            dialog.dismiss()
+                            result?.confirm()
+                        }
+                        .setOnCancelListener { result?.cancel() }
+                        .show()
+                    return true
+                } catch (_: Throwable) {
+                    result?.confirm()
+                    return true
+                }
+            }
+
+            override fun onJsConfirm(
+                view: WebView?, url: String?, message: String?, result: JsResult?
+            ): Boolean {
+                if (isFinishing || isDestroyed) {
+                    result?.cancel()
+                    return true
+                }
+                try {
+                    val appName = try { applicationInfo.loadLabel(packageManager).toString() } catch (_: Throwable) { "Confirm" }
+                    androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle(appName)
+                        .setMessage(message ?: "")
+                        .setPositiveButton(android.R.string.ok) { dialog, _ ->
+                            dialog.dismiss()
+                            result?.confirm()
+                        }
+                        .setNegativeButton(android.R.string.cancel) { dialog, _ ->
+                            dialog.dismiss()
+                            result?.cancel()
+                        }
+                        .setOnCancelListener { result?.cancel() }
+                        .show()
+                    return true
+                } catch (_: Throwable) {
+                    result?.cancel()
+                    return true
+                }
+            }
+
+            override fun onJsPrompt(
+                view: WebView?, url: String?, message: String?, defaultValue: String?, result: JsPromptResult?
+            ): Boolean {
+                if (isFinishing || isDestroyed) {
+                    result?.cancel()
+                    return true
+                }
+                try {
+                    val appName = try { applicationInfo.loadLabel(packageManager).toString() } catch (_: Throwable) { "Prompt" }
+                    val input = android.widget.EditText(this@MainActivity).apply {
+                        setText(defaultValue ?: "")
+                        setSingleLine()
+                    }
+                    val container = FrameLayout(this@MainActivity).apply {
+                        setPadding(48, 16, 48, 0)
+                        addView(input)
+                    }
+                    androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle(appName)
+                        .setMessage(message ?: "")
+                        .setView(container)
+                        .setPositiveButton(android.R.string.ok) { dialog, _ ->
+                            dialog.dismiss()
+                            result?.confirm(input.text.toString())
+                        }
+                        .setNegativeButton(android.R.string.cancel) { dialog, _ ->
+                            dialog.dismiss()
+                            result?.cancel()
+                        }
+                        .setOnCancelListener { result?.cancel() }
+                        .show()
+                    return true
+                } catch (_: Throwable) {
+                    result?.cancel()
+                    return true
+                }
             }
 
             // Handle window.open / target=_blank — most sites use these for share popups
@@ -3678,7 +3805,7 @@ class MainActivity : AppCompatActivity() {
         lastOfflineToastAt = now
         try {
             android.widget.Toast.makeText(
-                this, "Please check your internet connection", android.widget.Toast.LENGTH_SHORT
+                this, "Please Check your Internet Connection", android.widget.Toast.LENGTH_SHORT
             ).show()
         } catch (_: Exception) {}
     }
